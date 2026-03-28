@@ -20,7 +20,14 @@ def eszközök_letöltése(log_callback):
     if not os.path.isfile(YTDLP_EXE):
         log_callback("yt-dlp letöltése...")
         url = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe"
-        urllib.request.urlretrieve(url, YTDLP_EXE)
+        tmp = YTDLP_EXE + ".tmp"
+        try:
+            urllib.request.urlretrieve(url, tmp)
+            shutil.move(tmp, YTDLP_EXE)
+        except Exception:
+            if os.path.isfile(tmp):
+                os.remove(tmp)
+            raise
         log_callback("yt-dlp kész.")
 
     if not os.path.isfile(FFMPEG_EXE):
@@ -28,7 +35,12 @@ def eszközök_letöltése(log_callback):
         os.makedirs(FFMPEG_MAPPA, exist_ok=True)
         zip_path = os.path.join(APP_MAPPA, "ffmpeg.zip")
         url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip"
-        urllib.request.urlretrieve(url, zip_path)
+        try:
+            urllib.request.urlretrieve(url, zip_path)
+        except Exception:
+            if os.path.isfile(zip_path):
+                os.remove(zip_path)
+            raise
         log_callback("ffmpeg kicsomagolása...")
         with zipfile.ZipFile(zip_path, "r") as z:
             for member in z.namelist():
@@ -48,13 +60,19 @@ def formatumok_lekerese(url):
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUTF8"] = "1"
-    result = subprocess.run(
-        parancs, capture_output=True, text=True, encoding="utf-8", errors="replace",
-        creationflags=subprocess.CREATE_NO_WINDOW, env=env
-    )
+    try:
+        result = subprocess.run(
+            parancs, capture_output=True, text=True, encoding="utf-8", errors="replace",
+            creationflags=subprocess.CREATE_NO_WINDOW, env=env, timeout=60
+        )
+    except subprocess.TimeoutExpired:
+        return None, "Időtúllépés: a yt-dlp nem válaszolt 60 másodpercen belül."
     if result.returncode != 0:
         return None, result.stderr
-    info = json.loads(result.stdout)
+    try:
+        info = json.loads(result.stdout)
+    except json.JSONDecodeError as e:
+        return None, f"Érvénytelen válasz a yt-dlp-től: {e}"
     return info, None
 
 
@@ -62,18 +80,23 @@ def formatum_csoportositas(info):
     """Csoportosítja a formátumokat felbontás szerint, és visszaadja a legjobb videó+audió opciókat."""
     formats = info.get("formats", [])
     
-    # Videó formátumok szűrése (van kép)
+    # Videó formátumok szűrése (van kép vagy van height) - beleértve kombinált formátumokat is
     video_fmts = []
     for f in formats:
-        if f.get("vcodec", "none") != "none" and f.get("height"):
+        has_video = f.get("vcodec", "none") != "none" or f.get("height")
+        if has_video and f.get("height"):
             video_fmts.append(f)
     
-    # Legjobb audió keresése
+    # Legjobb audió keresése (külön audió stream, vagy kombinált formátumból)
     best_audio = None
     for f in formats:
-        if f.get("acodec", "none") != "none" and f.get("vcodec", "none") == "none":
+        if f.get("acodec", "none") != "none":
             abr = f.get("abr") or f.get("tbr") or 0
-            if best_audio is None or abr > (best_audio.get("abr") or best_audio.get("tbr") or 0):
+            is_audio_only = f.get("vcodec", "none") == "none"
+            best_abr = (best_audio.get("abr") or best_audio.get("tbr") or 0) if best_audio else 0
+            best_is_audio_only = (best_audio.get("vcodec", "none") == "none") if best_audio else False
+            # Előnyben részesítjük a külön audió streamet
+            if best_audio is None or (is_audio_only and not best_is_audio_only) or (not (best_is_audio_only and not is_audio_only) and abr > best_abr):
                 best_audio = f
 
     # Felbontás szerinti csoportosítás - minden felbontásból a legjobb
@@ -89,12 +112,16 @@ def formatum_csoportositas(info):
 
     eredmeny = []
     for height, f in rendezett:
-        w = f.get("width", "?")
+        w = f.get("width")
         h = f.get("height", "?")
-        vcodec = f.get("vcodec", "?")
-        if vcodec and "." in vcodec:
+        vcodec = f.get("vcodec") or None
+        if vcodec and vcodec != "none" and "." in vcodec:
             vcodec = vcodec.split(".")[0]
-        fps = f.get("fps", "?")
+        if not vcodec or vcodec == "none":
+            vcodec = None
+        fps = f.get("fps")
+        if fps and isinstance(fps, float) and fps == int(fps):
+            fps = int(fps)
         tbr = f.get("tbr")
         vbr = f.get("vbr")
         filesize = f.get("filesize") or f.get("filesize_approx")
@@ -113,40 +140,51 @@ def formatum_csoportositas(info):
         else:
             nev = f"{h}p"
 
-        # Bitrate szöveg
-        br_str = ""
+        # Leírás összeállítása - csak ami elérhető
+        reszek = [nev]
+        if w:
+            reszek.append(f"{w}x{h}")
+        if vcodec:
+            reszek.append(vcodec)
+        if fps:
+            reszek.append(f"{fps}fps")
         if vbr:
-            br_str = f"{vbr:.0f} kbps video"
+            reszek.append(f"{vbr:.0f} kbps video")
         elif tbr:
-            br_str = f"{tbr:.0f} kbps"
+            reszek.append(f"{tbr:.0f} kbps")
 
-        # Méret szöveg
-        size_str = ""
+        # Méret
         if filesize:
             mb = filesize / (1024 * 1024)
             if mb >= 1024:
-                size_str = f"~{mb/1024:.1f} GB"
+                reszek.append(f"~{mb/1024:.1f} GB")
             else:
-                size_str = f"~{mb:.0f} MB"
+                reszek.append(f"~{mb:.0f} MB")
 
         # Audió infó
-        audio_str = ""
-        if best_audio:
+        has_own_audio = f.get("acodec", "none") != "none"
+        needs_separate_audio = not has_own_audio
+        if needs_separate_audio and best_audio:
             ac = best_audio.get("acodec", "?")
             if ac and "." in ac:
                 ac = ac.split(".")[0]
             abr = best_audio.get("abr") or best_audio.get("tbr") or 0
-            audio_str = f" + {ac} {abr:.0f}kbps audio"
+            reszek.append(f"+ {ac} {abr:.0f}kbps audio")
+        elif has_own_audio:
+            ac = f.get("acodec", "?")
+            if ac and "." in ac:
+                ac = ac.split(".")[0]
+            abr = f.get("abr") or 0
+            if abr:
+                reszek.append(f"+ {ac} {abr:.0f}kbps audio")
 
-        leiras = f"{nev}  |  {w}x{h}  |  {vcodec}  |  {fps}fps  |  {br_str}{audio_str}"
-        if size_str:
-            leiras += f"  |  {size_str}"
+        leiras = "  |  ".join(reszek)
 
         eredmeny.append({
             "leiras": leiras,
             "height": h,
             "format_id": f.get("format_id"),
-            "best_audio_id": best_audio.get("format_id") if best_audio else None,
+            "best_audio_id": best_audio.get("format_id") if (needs_separate_audio and best_audio) else None,
         })
 
     return eredmeny
@@ -167,9 +205,21 @@ class ZeneLetolto(tk.Tk):
         self.formatumok = []
         self.process = None
         self._megszakitva = False
+        self._destroyed = False
 
         self._ui_felepites()
+        self.protocol("WM_DELETE_WINDOW", self._kilep)
         threading.Thread(target=self._init_eszközök, daemon=True).start()
+
+    def _kilep(self):
+        self._destroyed = True
+        if self.process and self.process.poll() is None:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=3)
+            except Exception:
+                self.process.kill()
+        self.destroy()
 
     def _ui_felepites(self):
         stilus = {"bg": "#1e1e2e", "fg": "#cdd6f4", "font": ("Segoe UI", 11)}
@@ -217,6 +267,8 @@ class ZeneLetolto(tk.Tk):
         tk.Radiobutton(mod_sor, text="🎵 Zene (MP3)", variable=self.mod_var, value="zene",
                        command=self._mod_valtozott, **cb_stilus).pack(side="left", padx=(0, 16))
         tk.Radiobutton(mod_sor, text="🎬 Videó (MP4)", variable=self.mod_var, value="video",
+                       command=self._mod_valtozott, **cb_stilus).pack(side="left", padx=(0, 16))
+        tk.Radiobutton(mod_sor, text="🥽 VR 3D (SBS)", variable=self.mod_var, value="vr",
                        command=self._mod_valtozott, **cb_stilus).pack(side="left")
 
         # Playlist checkbox
@@ -241,6 +293,12 @@ class ZeneLetolto(tk.Tk):
         self.fmt_canvas.pack(side="left", fill="both", expand=True)
         self.fmt_scrollbar.pack(side="right", fill="y")
 
+        # Egérgörgő támogatás
+        def _on_mousewheel(event):
+            self.fmt_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        self.fmt_canvas.bind("<MouseWheel>", _on_mousewheel)
+        self.fmt_belso.bind("<MouseWheel>", _on_mousewheel)
+
         self.fmt_valasztas = tk.StringVar()
 
         # Letöltés gomb
@@ -264,11 +322,22 @@ class ZeneLetolto(tk.Tk):
 
     def _log(self, szoveg):
         def _frissit():
+            if self._destroyed:
+                return
             self.naplo.config(state="normal")
             self.naplo.insert("end", szoveg + "\n")
+            # Max 500 sor megtartása
+            sorok = int(self.naplo.index('end-1c').split('.')[0])
+            if sorok > 500:
+                self.naplo.delete('1.0', f'{sorok - 500}.0')
             self.naplo.see("end")
             self.naplo.config(state="disabled")
-        self.after(0, _frissit)
+        if self._destroyed:
+            return
+        try:
+            self.after(0, _frissit)
+        except RuntimeError:
+            pass
 
     def _init_eszközök(self):
         try:
@@ -285,10 +354,10 @@ class ZeneLetolto(tk.Tk):
 
     def _url_ellenorzes(self, url):
         if not url:
-            messagebox.showwarning("Figyelem", "Adj meg egy YouTube URL-t!")
+            messagebox.showwarning("Figyelem", "Adj meg egy URL-t!")
             return False
-        if "youtube.com/" not in url and "youtu.be/" not in url:
-            messagebox.showwarning("Figyelem", "Ez nem YouTube link!\nPélda: https://www.youtube.com/watch?v=XXXXX")
+        if not url.startswith("http://") and not url.startswith("https://"):
+            messagebox.showwarning("Figyelem", "Adj meg egy érvényes URL-t!\nPélda: https://www.youtube.com/watch?v=XXXXX")
             return False
         return True
 
@@ -304,9 +373,14 @@ class ZeneLetolto(tk.Tk):
             return
         self.fut = True
         self.lekerdezes_gomb.config(state="disabled", text="⏳ Lekérdezés...")
-        threading.Thread(target=self._formatumok_worker, args=(url,), daemon=True).start()
+        # Régi formátumok törlése azonnal
+        self.formatumok = []
+        self.fmt_keret.pack_forget()
+        for w in self.fmt_belso.winfo_children():
+            w.destroy()
+        threading.Thread(target=self._formatumok_worker, args=(url, self.mod_var.get()), daemon=True).start()
 
-    def _formatumok_worker(self, url):
+    def _formatumok_worker(self, url, mod):
         try:
             self._log(f"\nFormátumok lekérdezése: {url}")
             info, hiba = formatumok_lekerese(url)
@@ -326,13 +400,20 @@ class ZeneLetolto(tk.Tk):
                     hossz_str = f"  |  {perc}:{mp:02d}"
             self._log(f"📹 {cim}{hossz_str}")
 
-            if self.mod_var.get() == "zene":
+            if mod == "zene":
                 # Régi formátumok törlése
                 self.formatumok = []
-                self.after(0, lambda: self.fmt_keret.pack_forget())
+                try:
+                    if not self._destroyed:
+                        self.after(0, lambda: self.fmt_keret.pack_forget())
+                except RuntimeError:
+                    pass
                 # Audió infó kiírása
                 formats = info.get("formats", [])
                 audio_fmts = [f for f in formats if f.get("acodec", "none") != "none" and f.get("vcodec", "none") == "none"]
+                if not audio_fmts:
+                    # Kombinált formátumokból keressük az audiót
+                    audio_fmts = [f for f in formats if f.get("acodec", "none") != "none"]
                 if audio_fmts:
                     best = max(audio_fmts, key=lambda f: f.get("abr") or f.get("tbr") or 0)
                     ac = best.get("acodec", "?")
@@ -345,21 +426,82 @@ class ZeneLetolto(tk.Tk):
                 self._log("✅ Kész a letöltésre! Nyomj Letöltést.")
                 return
 
+            if mod == "vr":
+                # VR: legjobb minőség infó kiírása
+                self.formatumok = []
+                try:
+                    if not self._destroyed:
+                        self.after(0, lambda: self.fmt_keret.pack_forget())
+                except RuntimeError:
+                    pass
+                formats = info.get("formats", [])
+                video_fmts = [f for f in formats if (f.get("vcodec", "none") != "none" or f.get("height")) and f.get("height")]
+                if video_fmts:
+                    best_v = max(video_fmts, key=lambda f: (f.get("height", 0), f.get("tbr", 0) or 0))
+                    h = best_v.get("height", "?")
+                    w = best_v.get("width")
+                    vcodec = best_v.get("vcodec")
+                    if vcodec and vcodec != "none" and "." in vcodec:
+                        vcodec = vcodec.split(".")[0]
+                    elif not vcodec or vcodec == "none":
+                        vcodec = None
+                    fps = best_v.get("fps")
+                    tbr = best_v.get("tbr") or best_v.get("vbr") or 0
+                    filesize = best_v.get("filesize") or best_v.get("filesize_approx")
+                    reszek = []
+                    if w:
+                        reszek.append(f"{w}x{h}")
+                    else:
+                        reszek.append(f"{h}p")
+                    if vcodec:
+                        reszek.append(vcodec)
+                    if fps:
+                        reszek.append(f"{int(fps) if isinstance(fps, float) and fps == int(fps) else fps}fps")
+                    if tbr:
+                        reszek.append(f"{tbr:.0f} kbps")
+                    if filesize:
+                        mb = filesize / (1024 * 1024)
+                        reszek.append(f"~{mb/1024:.1f} GB" if mb >= 1024 else f"~{mb:.0f} MB")
+                    self._log(f"🥽 Legjobb videó: {' | '.join(reszek)}")
+                audio_fmts = [f for f in formats if f.get("acodec", "none") != "none" and f.get("vcodec", "none") == "none"]
+                if not audio_fmts:
+                    audio_fmts = [f for f in formats if f.get("acodec", "none") != "none"]
+                if audio_fmts:
+                    best_a = max(audio_fmts, key=lambda f: f.get("abr") or f.get("tbr") or 0)
+                    ac = best_a.get("acodec", "?")
+                    if ac and "." in ac:
+                        ac = ac.split(".")[0]
+                    abr = best_a.get("abr") or best_a.get("tbr") or 0
+                    self._log(f"🥽 Legjobb audió: {ac} | {abr:.0f} kbps")
+                self._log("✅ Kész a letöltésre! Nyomj Letöltést.")
+                return
+
             self.formatumok = formatum_csoportositas(info)
 
             if not self.formatumok:
                 self._log("❌ Nem találtam elérhető videó formátumokat.")
                 return
 
+            # Legjobb minőség kiírása
+            legjobb = self.formatumok[-1]
+            self._log(f"🎬 Legjobb: {legjobb['leiras']}")
             self._log(f"✅ {len(self.formatumok)} felbontás elérhető.")
 
             # UI frissítés a fő szálban
-            self.after(0, self._formatumok_megjelenites)
+            try:
+                if not self._destroyed:
+                    self.after(0, self._formatumok_megjelenites)
+            except RuntimeError:
+                pass
         except Exception as e:
             self._log(f"❌ Hiba: {e}")
         finally:
             self.fut = False
-            self.after(0, lambda: self.lekerdezes_gomb.config(state="normal", text="🔍 Lekérdezés"))
+            try:
+                if not self._destroyed:
+                    self.after(0, lambda: self.lekerdezes_gomb.config(state="normal", text="🔍 Lekérdezés"))
+            except RuntimeError:
+                pass
 
     def _formatumok_megjelenites(self):
         # Töröljük a régi opciókat
@@ -370,25 +512,34 @@ class ZeneLetolto(tk.Tk):
         if self.formatumok:
             self.fmt_valasztas.set(str(self.formatumok[-1]["height"]))
 
+        self.fmt_canvas.yview_moveto(0)  # Scroll reset
         for fmt in reversed(self.formatumok):  # Legnagyobb felül
-            tk.Radiobutton(
+            rb = tk.Radiobutton(
                 self.fmt_belso, text=fmt["leiras"],
                 variable=self.fmt_valasztas, value=str(fmt["height"]),
                 font=("Consolas", 10), bg="#181825", fg="#cdd6f4",
                 selectcolor="#313244", activebackground="#181825",
                 activeforeground="#cdd6f4", cursor="hand2", anchor="w",
                 wraplength=680, justify="left"
-            ).pack(fill="x", anchor="w", padx=4, pady=1)
+            )
+            rb.pack(fill="x", anchor="w", padx=4, pady=1)
+            rb.bind("<MouseWheel>", lambda e: self.fmt_canvas.yview_scroll(int(-1 * (e.delta / 120)), "units"))
 
         if self.mod_var.get() == "video":
             self.fmt_keret.pack(fill="both", expand=True, padx=20, pady=(4, 0),
                                 before=self.gomb)
 
     def _megallitas(self):
-        if self.process and self.process.poll() is None:
-            self._megszakitva = True
-            self.process.terminate()
-            self._log("⛔ Letöltés megszakítva.")
+        if not self.letolt_fut:
+            return
+        try:
+            proc = self.process
+            if proc and proc.poll() is None:
+                self._megszakitva = True
+                proc.terminate()
+                self._log("⛔ Letöltés megszakítva.")
+        except OSError:
+            pass
 
     def _letoltes_inditasa(self):
         url = self.url_mezo.get().strip()
@@ -405,9 +556,13 @@ class ZeneLetolto(tk.Tk):
         if not os.path.isfile(YTDLP_EXE):
             self._log("⚠️ Az eszközök még letöltődnek, várj!")
             return
-        if self.mod_var.get() == "video" and not self.formatumok:
+        mod = self.mod_var.get()
+        if mod == "video" and not self.formatumok:
             messagebox.showwarning("Figyelem", "Először nyomj Lekérdezést a felbontások letöltéséhez!")
             return
+        if mod == "vr":
+            self.formatumok = []
+            self.fmt_keret.pack_forget()
 
         # Playlist figyelmeztetés
         if self.playlist_var.get() and "list=" not in url:
@@ -422,25 +577,35 @@ class ZeneLetolto(tk.Tk):
         self.fut = True
         self.letolt_fut = True
         self.gomb.config(state="normal", text="⛔ Megszakítás", command=self._megallitas)
-        threading.Thread(target=self._letoltes, args=(url,), daemon=True).start()
-
-    def _letoltes(self, url):
+        self.lekerdezes_gomb.config(state="disabled")
+        playlist = self.playlist_var.get()
         mappa = self.mappa_var.get()
+        fmt_valasztas = self.fmt_valasztas.get()
+        formatumok = list(self.formatumok)
+        threading.Thread(target=self._letoltes, args=(url, mod, playlist, mappa, fmt_valasztas, formatumok), daemon=True).start()
+
+    def _letoltes(self, url, mod, playlist, mappa, fmt_valasztas, formatumok):
         os.makedirs(mappa, exist_ok=True)
-        video_mod = self.mod_var.get() == "video"
+        video_mod = mod == "video"
 
         parancs = [YTDLP_EXE, "--ffmpeg-location", FFMPEG_MAPPA,
-                  "--windows-filenames"]
+                  "--windows-filenames", "--progress"]
 
-        if video_mod:
+        vr_mod = mod == "vr"
+
+        if vr_mod:
+            parancs += ["-f", "bestvideo+bestaudio/best",
+                        "--merge-output-format", "mp4",
+                        "--embed-metadata"]
+        elif video_mod:
             # Kiválasztott felbontás alapján format string
             try:
-                valasztott_h = int(self.fmt_valasztas.get())
+                valasztott_h = int(fmt_valasztas)
             except (ValueError, TypeError):
                 valasztott_h = 0
             # Keresés a lekérdezett formátumok között
             valasztott = None
-            for fmt in self.formatumok:
+            for fmt in formatumok:
                 if fmt["height"] == valasztott_h:
                     valasztott = fmt
                     break
@@ -451,7 +616,7 @@ class ZeneLetolto(tk.Tk):
                 fmt_str = valasztott["format_id"]
             else:
                 if valasztott_h > 0:
-                    fmt_str = f"bestvideo[height<={valasztott_h}]+bestaudio/best[height<={valasztott_h}]"
+                    fmt_str = f"bestvideo[height<={valasztott_h}]+bestaudio/best"
                 else:
                     fmt_str = "bestvideo+bestaudio/best"
 
@@ -461,10 +626,16 @@ class ZeneLetolto(tk.Tk):
             parancs += ["-x", "--audio-format", "mp3", "--audio-quality", "0",
                         "--embed-thumbnail", "--embed-metadata"]
 
-        if self.playlist_var.get():
-            parancs += ["--yes-playlist", "-o", os.path.join(mappa, "%(playlist_title)s", "%(playlist_index)03d - %(title)s.%(ext)s")]
+        # Fájlnév sablon
+        if vr_mod:
+            nev_sablon = "%(title)s_3D_SBS.%(ext)s"
         else:
-            parancs += ["--no-playlist", "-o", os.path.join(mappa, "%(title)s.%(ext)s")]
+            nev_sablon = "%(title)s.%(ext)s"
+
+        if playlist:
+            parancs += ["--yes-playlist", "-o", os.path.join(mappa, "%(playlist_title)s", "%(playlist_index)03d - " + nev_sablon)]
+        else:
+            parancs += ["--no-playlist", "-o", os.path.join(mappa, nev_sablon)]
 
         parancs += ["--newline", url]
 
@@ -510,7 +681,12 @@ class ZeneLetolto(tk.Tk):
             self.process = None
             self.fut = False
             self.letolt_fut = False
-            self.after(0, lambda: self.gomb.config(state="normal", text="⬇  Letöltés", command=self._letoltes_inditasa))
+            try:
+                if not self._destroyed:
+                    self.after(0, lambda: self.lekerdezes_gomb.config(state="normal"))
+                    self.after(0, lambda: self.gomb.config(state="normal", text="⬇  Letöltés", command=self._letoltes_inditasa))
+            except RuntimeError:
+                pass
 
 
 if __name__ == "__main__":
