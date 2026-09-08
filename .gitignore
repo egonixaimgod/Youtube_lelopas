@@ -1,5 +1,10 @@
 build/
 dist/
-*.spec
 __pycache__/
 *.log
+*.log.1
+
+# A projekt saját spec fájlja viszont kell (a build ebből dolgozik),
+# csak a PyInstaller által generált ideiglenesek nem.
+*.spec
+!YouTubeLetolto.spec

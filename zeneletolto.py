@@ -1,5 +1,15 @@
+# -*- coding: utf-8 -*-
+"""YouTube Letöltő - egyfájlos Tkinter kezelőfelület a yt-dlp köré.
+
+A program magától letölti a yt-dlp-t és az ffmpeg-et, lekérdezi a videó
+elérhető minőségeit, és letölti a kiválasztottat - vagy annak csak egy
+megadott szakaszát (saját Range-alapú letöltővel, mert a YouTube a
+szekvenciális olvasást fojtja).
+"""
+
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, ttk
+import concurrent.futures
 import subprocess
 import threading
 import os
@@ -7,6 +17,7 @@ import re
 import sys
 import time
 import json
+import locale
 import struct
 import datetime
 import traceback
@@ -15,12 +26,17 @@ import urllib.error
 import zipfile
 import shutil
 
+VERZIO = "2.0"
+BUILD_SZAM = 2                 # a rebuild szkript növeli minden kiadásnál
+PROGRAM_NEV = "YouTube Letöltő"
+
 APP_MAPPA = os.path.join(os.getenv("LOCALAPPDATA", "."), "ZeneLetolto")
 YTDLP_EXE = os.path.join(APP_MAPPA, "yt-dlp.exe")
 FFMPEG_MAPPA = os.path.join(APP_MAPPA, "ffmpeg")
 FFMPEG_EXE = os.path.join(FFMPEG_MAPPA, "ffmpeg.exe")
+BEALLITAS_FAJL = os.path.join(APP_MAPPA, "beallitasok.json")
 
-# ---- Naplózás fájlba (az exe mellé) ----
+# ---------------------------------------------------------------- naplózás --
 
 NAPLO_MAX_MERET = 5 * 1024 * 1024
 
@@ -82,6 +98,45 @@ def naplo_parancs(cimke, parancs):
     fajlba_naplo(f"{cimke}: {' '.join(reszek)}")
 
 
+def sor_dekodolas(nyers):
+    """Alfolyamat kimenetének dekódolása.
+
+    A yt-dlp néha a Windows kódlapján ír (ilyenkor az ékezetes cím
+    olvashatatlan lenne a naplóban), ezért az utf-8 után azzal is próbálkozunk.
+    """
+    for kodolas in ("utf-8", locale.getpreferredencoding(False) or "cp1252"):
+        try:
+            return nyers.decode(kodolas)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return nyers.decode("utf-8", "replace")
+
+
+# ------------------------------------------------------------- beállítások --
+
+
+def beallitasok_betoltes():
+    """Elmentett felhasználói beállítások. Hiba esetén üres szótár."""
+    try:
+        with open(BEALLITAS_FAJL, "r", encoding="utf-8") as f:
+            adat = json.load(f)
+        return adat if isinstance(adat, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def beallitasok_mentes(adat):
+    try:
+        os.makedirs(APP_MAPPA, exist_ok=True)
+        with open(BEALLITAS_FAJL, "w", encoding="utf-8") as f:
+            json.dump(adat, f, ensure_ascii=False, indent=1)
+    except (OSError, ValueError) as e:
+        fajlba_naplo(f"beállítások mentése sikertelen: {e}")
+
+
+# ------------------------------------------------------ eszközök letöltése --
+
+
 def eszközök_letöltése(log_callback):
     os.makedirs(APP_MAPPA, exist_ok=True)
 
@@ -102,7 +157,8 @@ def eszközök_letöltése(log_callback):
         log_callback("ffmpeg letöltése (ez eltarthat egy percig)...")
         os.makedirs(FFMPEG_MAPPA, exist_ok=True)
         zip_path = os.path.join(APP_MAPPA, "ffmpeg.zip")
-        url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip"
+        url = ("https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/"
+               "ffmpeg-master-latest-win64-gpl.zip")
         try:
             urllib.request.urlretrieve(url, zip_path)
         except Exception:
@@ -167,7 +223,6 @@ def ytdlp_frissites(log_callback):
         if "Updated yt-dlp" in kimenet:
             log_callback("✅ yt-dlp frissítve a legújabb verzióra.")
         elif r.returncode == 0:
-            log_callback("yt-dlp naprakész.")
             # Ne próbálkozzon minden indításkor újra
             os.utime(YTDLP_EXE, None)
         else:
@@ -177,16 +232,18 @@ def ytdlp_frissites(log_callback):
         fajlba_naplo(traceback.format_exc())
 
 
-# A szakaszos letöltéshez tartozó beállítások.
+# ------------------------------------------------------- szakasz-letöltés ---
+
 # A YouTube a szekvenciális GET-et erősen fojtja (~250 kB/s), a Range kéréseket
-# viszont teljes sebességgel szolgálja ki. Az ffmpeg viszont nem küld Range
-# kérést seekeléskor, hanem végigolvassa a fájlt ("soft-seeking to offset ... by
+# viszont teljes sebességgel szolgálja ki. Az ffmpeg nem küld Range kérést
+# seekeléskor, hanem végigolvassa a fájlt ("soft-seeking to offset ... by
 # draining ..."), ezért egy 3 órás pozícióig órákig tartana eljutnia. Emiatt a
-# szakaszt magunk töltjük le: a fragmentált mp4 `sidx` indexéből kiszámoljuk a
-# kért időtartomány byte-tartományát, azt darabolt Range kérésekkel leszedjük egy
-# sparse fájlba, és abból vág az ffmpeg.
-SZAKASZ_FEJLEC_MERET = 1 * 1024 * 1024   # ennyi byte-ból már kiolvasható a sidx
+# szakaszt magunk töltjük le: a stream saját indexéből (mp4 -> sidx,
+# webm -> Cues) kiszámoljuk a kért időtartomány byte-tartományát, azt darabolt
+# Range kérésekkel leszedjük egy sparse fájlba, és abból vág az ffmpeg.
+SZAKASZ_FEJLEC_MERET = 1 * 1024 * 1024   # ennyi byte-ból már kiolvasható az index
 SZAKASZ_DARAB_MERET = 4 * 1024 * 1024    # egy Range kérés mérete
+SZAKASZ_PARHUZAM = 4                     # egyszerre ennyi Range kérés fut
 SZAKASZ_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36")
 
@@ -195,12 +252,13 @@ class UrlLejartHiba(Exception):
     """A googlevideo URL érvénytelenné vált (403/410) - újat kell kérni."""
 
 
-def http_tartomany(url, kezd=None, veg=None, timeout=60, probalkozas=3):
-    """HTTP Range kérés. `veg` bezárólag értendő, None esetén a fájl végéig.
+def http_tartomany_info(url, kezd=None, veg=None, timeout=60, probalkozas=3):
+    """HTTP Range kérés. -> (adat, teljes_fájlméret vagy None).
 
-    Az aláírt googlevideo URL-ek több GB-os letöltés közben érvénytelenné
-    válhatnak - ilyenkor UrlLejartHiba jön, hogy a hívó frissíthesse az URL-t.
-    A többi hálózati hiba átmeneti lehet, azt itt újrapróbáljuk.
+    `veg` bezárólag értendő, None esetén a fájl végéig. Az aláírt googlevideo
+    URL-ek több GB-os letöltés közben érvénytelenné válhatnak - ilyenkor
+    UrlLejartHiba jön, hogy a hívó frissíthesse az URL-t. A többi hálózati hiba
+    átmeneti lehet, azt itt újrapróbáljuk.
     """
     utolso = None
     for kiserlet in range(probalkozas):
@@ -209,7 +267,15 @@ def http_tartomany(url, kezd=None, veg=None, timeout=60, probalkozas=3):
             keres.add_header("Range", f"bytes={kezd}-{'' if veg is None else veg}")
         try:
             with urllib.request.urlopen(keres, timeout=timeout) as valasz:
-                return valasz.read()
+                adat = valasz.read()
+                teljes = None
+                tartomany = valasz.headers.get("Content-Range") or ""
+                m = re.search(r"/(\d+)\s*$", tartomany)
+                if m:
+                    teljes = int(m.group(1))
+                elif valasz.headers.get("Content-Length") and kezd in (None, 0):
+                    teljes = int(valasz.headers["Content-Length"])
+                return adat, teljes
         except urllib.error.HTTPError as e:
             if e.code in (403, 410):
                 raise UrlLejartHiba(f"HTTP {e.code}") from e
@@ -221,11 +287,17 @@ def http_tartomany(url, kezd=None, veg=None, timeout=60, probalkozas=3):
     raise utolso
 
 
+def http_tartomany(url, kezd=None, veg=None, timeout=60, probalkozas=3):
+    """Mint a http_tartomany_info, de csak az adatot adja vissza."""
+    return http_tartomany_info(url, kezd, veg, timeout, probalkozas)[0]
+
+
 def mp4_sidx_olvasas(fejlec):
     """Fragmentált mp4 `sidx` indexének kiolvasása.
 
-    Visszaad: {"timescale", "adat_kezd", "szegmensek": [(byte_meret, idotartam)]}
-    vagy None, ha a fájlban nincs sidx (pl. webm, vagy nem fragmentált mp4).
+    Visszaad egy egységes indexet: {"tipus", "adat_kezd", "meret",
+    "pontok": [(kezdo_ido_mp, byte_offset)]} - vagy None, ha a fájlban nincs
+    sidx (pl. webm, vagy nem fragmentált mp4).
     """
     o = 0
     while o + 8 <= len(fejlec):
@@ -259,16 +331,17 @@ def mp4_sidx_olvasas(fejlec):
             p += 2
             if not timescale or not darab or p + darab * 12 > len(fejlec):
                 return None
-            szegmensek = []
+            adat_kezd = o + meret + elso_offset
+            pontok = []
+            poz, ido = adat_kezd, 0
             for _ in range(darab):
                 r1, tartam, _r3 = struct.unpack(">III", fejlec[p:p + 12])
                 p += 12
-                szegmensek.append((r1 & 0x7FFFFFFF, tartam))
-            return {
-                "timescale": timescale,
-                "adat_kezd": o + meret + elso_offset,
-                "szegmensek": szegmensek,
-            }
+                pontok.append((ido / timescale, poz))
+                poz += r1 & 0x7FFFFFFF
+                ido += tartam
+            return {"tipus": "mp4", "adat_kezd": adat_kezd,
+                    "meret": poz, "pontok": pontok}
 
         # A sidx a moov után, az első moof előtt áll: ha idáig eljutottunk, nincs
         if tipus in (b"moof", b"mdat"):
@@ -277,29 +350,163 @@ def mp4_sidx_olvasas(fejlec):
     return None
 
 
-def sidx_byte_tartomany(index, kezd_mp, veg_mp):
-    """Időtartomány -> (byte_kezd, byte_veg) a sidx alapján.
+# --- WebM / Matroska Cues index (a YouTube 4K/8K VP9 streamjei webm-ek) ---
+
+EBML_SEGMENT = 0x18538067
+EBML_INFO = 0x1549A966
+EBML_TIMESTAMPSCALE = 0x2AD7B1
+EBML_CUES = 0x1C53BB6B
+EBML_CUEPOINT = 0xBB
+EBML_CUETIME = 0xB3
+EBML_CUETRACKPOS = 0xB7
+EBML_CUECLUSTERPOS = 0xF1
+
+
+def _ebml_vint(adat, o, id_mod=False):
+    """EBML változó hosszú egész. -> (érték, új offset, ismeretlen_hossz)."""
+    if o >= len(adat):
+        return None, o, False
+    elso = adat[o]
+    if elso == 0:
+        return None, o, False
+    hossz, maszk = 1, 0x80
+    while not elso & maszk:
+        maszk >>= 1
+        hossz += 1
+        if hossz > 8:
+            return None, o, False
+    if o + hossz > len(adat):
+        return None, o, False
+    if id_mod:                                   # az azonosító a markerrel együtt
+        return int.from_bytes(adat[o:o + hossz], "big"), o + hossz, False
+    ertek = elso & (maszk - 1)
+    ismeretlen = ertek == maszk - 1
+    for b in adat[o + 1:o + hossz]:
+        ertek = (ertek << 8) | b
+        ismeretlen = ismeretlen and b == 0xFF
+    return ertek, o + hossz, ismeretlen
+
+
+def _ebml_elemek(adat, kezd, veg):
+    """EBML elemek felsorolása egy szinten: (azonosító, adat_kezd, adat_vég)."""
+    o = kezd
+    while o < veg:
+        azon, o2, _ = _ebml_vint(adat, o, True)
+        if azon is None:
+            return
+        meret, o3, ismeretlen = _ebml_vint(adat, o2)
+        if meret is None:
+            return
+        if ismeretlen:                 # a fájl végéig tart (streamelt Segment)
+            yield azon, o3, veg
+            return
+        vege = o3 + meret
+        yield azon, o3, min(vege, veg)
+        if vege <= o:                  # védelem a végtelen ciklus ellen
+            return
+        o = vege
+
+
+def _ebml_egesz(adat, kezd, veg):
+    return int.from_bytes(adat[kezd:veg], "big") if veg > kezd else 0
+
+
+def webm_cues_olvasas(fejlec):
+    """Matroska/WebM `Cues` index kiolvasása, ugyanolyan alakban, mint a sidx.
+
+    A YouTube webm_dash streamjeinél a Cues a fájl elején, az első Cluster
+    előtt van, tehát ugyanúgy kiolvasható az első pár tíz kB-ból.
+    """
+    szegmens = None
+    for azon, ek, ev in _ebml_elemek(fejlec, 0, len(fejlec)):
+        if azon == EBML_SEGMENT:
+            szegmens = (ek, ev)
+            break
+    if not szegmens:
+        return None
+    seg_kezd, seg_veg = szegmens
+
+    timescale = 1000000                          # alapértelmezés: 1 ms
+    pontok = []
+    for azon, ek, ev in _ebml_elemek(fejlec, seg_kezd, seg_veg):
+        if azon == EBML_INFO:
+            for a2, k2, v2 in _ebml_elemek(fejlec, ek, ev):
+                if a2 == EBML_TIMESTAMPSCALE:
+                    timescale = _ebml_egesz(fejlec, k2, v2) or timescale
+        elif azon == EBML_CUES:
+            for a2, k2, v2 in _ebml_elemek(fejlec, ek, ev):
+                if a2 != EBML_CUEPOINT:
+                    continue
+                ido = poz = None
+                for a3, k3, v3 in _ebml_elemek(fejlec, k2, v2):
+                    if a3 == EBML_CUETIME:
+                        ido = _ebml_egesz(fejlec, k3, v3)
+                    elif a3 == EBML_CUETRACKPOS and poz is None:
+                        for a4, k4, v4 in _ebml_elemek(fejlec, k3, v3):
+                            if a4 == EBML_CUECLUSTERPOS:
+                                poz = _ebml_egesz(fejlec, k4, v4)
+                                break
+                if ido is not None and poz is not None:
+                    pontok.append((ido * timescale / 1e9, seg_kezd + poz))
+    if not pontok:
+        return None
+    pontok.sort(key=lambda p: p[1])
+    return {"tipus": "webm", "adat_kezd": pontok[0][1], "meret": None,
+            "pontok": pontok}
+
+
+def media_index_olvasas(fejlec):
+    """A stream időbélyeg -> byte index-e, konténertől függetlenül."""
+    return mp4_sidx_olvasas(fejlec) or webm_cues_olvasas(fejlec)
+
+
+WEBM_ELOLAP_MERET = 6 * 1024 * 1024
+
+
+def webm_elolap_tartomany(index, byte_kezd):
+    """A webm első klaszterének byte-tartománya (vagy None).
+
+    Az mp4 `moov` boxa mindent leír a sávról, a Matroska `Tracks` viszont nem:
+    az ffmpeg a fájl elejéről olvasott csomagokból állapítja meg a
+    pixelformátumot. A lyukas fájl elején csupa nullát talál
+    ("0x00 ... invalid as first byte of an EBML number"), amitől duplikált,
+    hiányos streamet hoz létre, és a videósáv kimarad a kimenetből. Ezért az
+    első klasztert is letöltjük - pár MB, és ettől a fájl az elejétől
+    értelmezhető, a Cues alapján pedig ugyanúgy a kért helyre ugrik.
+    """
+    adat_kezd = index["adat_kezd"]
+    if byte_kezd <= adat_kezd:
+        return None                      # a kért szakasz amúgy is az elején van
+    veg = None
+    for _, offset in index["pontok"]:
+        if offset - adat_kezd >= WEBM_ELOLAP_MERET:
+            veg = offset                 # egész klaszterhatárig kérünk
+            break
+    veg = min(veg or adat_kezd + WEBM_ELOLAP_MERET, byte_kezd)
+    return (adat_kezd, veg) if veg > adat_kezd else None
+
+
+def index_byte_tartomany(index, teljes_meret, kezd_mp, veg_mp):
+    """Időtartomány -> (byte_kezd, byte_veg).
 
     A szegmenshatárok kulcsképkockán vannak, ezért a kezdetet lefelé, a véget
     felfelé kerekítjük egész szegmensre - így az ffmpeg pontosan tud vágni.
     """
-    ts = index["timescale"]
-    poz = index["adat_kezd"]
-    ido = 0
-    byte_kezd = None
-    byte_veg = None
-    for meret, tartam in index["szegmensek"]:
-        szeg_kezd = ido / ts
-        szeg_veg = (ido + tartam) / ts
-        if byte_kezd is None and szeg_veg > kezd_mp:
-            byte_kezd = poz
-        if byte_kezd is not None:
-            byte_veg = poz + meret
-            if szeg_kezd >= veg_mp:
-                break
-        poz += meret
-        ido += tartam
-    if byte_kezd is None:
+    pontok = index.get("pontok") or []
+    if not pontok:
+        return None
+    byte_kezd = pontok[0][1]
+    for ido, offset in pontok:
+        if ido <= kezd_mp:
+            byte_kezd = offset
+        else:
+            break
+    byte_veg = index.get("meret") or teljes_meret
+    for ido, offset in pontok:
+        if ido >= veg_mp:
+            byte_veg = offset
+            break
+    if not byte_veg or byte_veg <= byte_kezd:
         return None
     return byte_kezd, byte_veg
 
@@ -341,9 +548,12 @@ def sparse_fajl_letrehozas(utvonal, meret):
     return True
 
 
+# ------------------------------------------------------------- segédfüggvények --
+
+
 def ido_ertelmezes(szoveg):
     """'1:20:30' / '20:30' / '90' -> másodperc. None ha érvénytelen."""
-    szoveg = (szoveg or "").strip().replace(".", ":")
+    szoveg = (szoveg or "").strip().replace(".", ":").replace(",", ":")
     if not szoveg:
         return None
     reszek = szoveg.split(":")
@@ -374,6 +584,18 @@ def ido_formazas(mp):
     return f"{perc}:{s:02d}"
 
 
+def meret_formazas(byte_szam):
+    """Byte -> '18.7 GB' / '243 MB' / '-'."""
+    if not byte_szam:
+        return "–"
+    mb = byte_szam / (1024 * 1024)
+    if mb >= 1024:
+        return f"{mb / 1024:.1f} GB"
+    if mb >= 10:
+        return f"{mb:.0f} MB"
+    return f"{mb:.1f} MB"
+
+
 def fajlnev_tisztitas(nev):
     """Windows-on tiltott karakterek cseréje."""
     nev = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", nev or "video")
@@ -381,22 +603,45 @@ def fajlnev_tisztitas(nev):
     return nev[:120]
 
 
-def formatumok_lekerese(url, extra=None):
-    """Lekéri az elérhető formátumokat yt-dlp -j segítségével."""
-    parancs = [YTDLP_EXE, "-j", "--no-playlist"] + (extra or []) + [url]
-    naplo_parancs("yt-dlp lekérdezés", parancs)
+def url_rendbetetel(url):
+    """Elgépelt / séma nélküli linkek megbocsátása."""
+    url = (url or "").strip().strip('"').strip("'")
+    if url and not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", url):
+        if re.match(r"^(www\.|[\w-]+\.[a-z]{2,})", url):
+            url = "https://" + url
+    return url
+
+
+# --------------------------------------------------------- yt-dlp lekérdezés --
+
+YTDLP_TIMEOUT = 90
+
+
+def _ytdlp_kornyezet():
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUTF8"] = "1"
+    return env
+
+
+def formatumok_lekerese(url, extra=None):
+    """Lekéri az elérhető formátumokat yt-dlp -j segítségével.
+
+    `extra` további kapcsolókat fűz be - a szakaszletöltő ezzel adja át a
+    -S/-f kapcsolókat, hogy visszakapja a feloldott `requested_formats`
+    listát a közvetlen stream URL-ekkel.
+    """
+    parancs = [YTDLP_EXE, "-j", "--no-playlist"] + (extra or []) + [url]
+    naplo_parancs("yt-dlp lekérdezés", parancs)
     try:
         result = subprocess.run(
-            parancs, capture_output=True, text=True, encoding="utf-8", errors="replace",
-            creationflags=subprocess.CREATE_NO_WINDOW, env=env, timeout=60
-        )
+            parancs, capture_output=True, text=True, encoding="utf-8",
+            errors="replace", creationflags=subprocess.CREATE_NO_WINDOW,
+            env=_ytdlp_kornyezet(), timeout=YTDLP_TIMEOUT)
     except subprocess.TimeoutExpired:
-        return None, "Időtúllépés: a yt-dlp nem válaszolt 60 másodpercen belül."
+        return None, f"A yt-dlp nem válaszolt {YTDLP_TIMEOUT} másodpercen belül."
     if result.returncode != 0:
-        return None, result.stderr
+        return None, ytdlp_hiba_forditas(result.stderr)
     try:
         info = json.loads(result.stdout)
     except json.JSONDecodeError as e:
@@ -404,312 +649,998 @@ def formatumok_lekerese(url, extra=None):
     return info, None
 
 
+def ytdlp_hiba_forditas(stderr):
+    """A yt-dlp hibaüzenetéből érthető magyar mondat."""
+    szoveg = (stderr or "").strip()
+    minta = [
+        ("Video unavailable", "A videó nem elérhető (törölték vagy régiózárt)."),
+        ("Private video", "Ez egy privát videó, nem lehet letölteni."),
+        ("members-only", "Ez a videó csak csatornatagoknak érhető el."),
+        ("age", "Korhatáros videó - bejelentkezés nélkül nem tölthető le."),
+        ("confirm you're not a bot", "A YouTube robotellenőrzést kér erre a videóra."),
+        ("Sign in", "A YouTube bejelentkezést kér ehhez a videóhoz."),
+        ("Unsupported URL", "Ezt az oldalt a yt-dlp nem ismeri."),
+        ("Incomplete YouTube ID", "Hiányos a videó azonosítója - ellenőrizd a linket."),
+        ("is not a valid URL", "Ez nem érvényes link."),
+        ("Requested format is not available", "A kért formátum már nem elérhető."),
+        ("HTTP Error 429", "A YouTube átmenetileg letiltotta a gépedet (túl sok kérés). Várj pár percet."),
+        ("Temporary failure in name resolution", "Nincs internetkapcsolat."),
+        ("getaddrinfo failed", "Nincs internetkapcsolat."),
+    ]
+    for kulcs, uzenet in minta:
+        if kulcs.lower() in szoveg.lower():
+            return uzenet
+    # Az utolsó ERROR: sor általában a lényeg
+    hibak = [s for s in szoveg.splitlines() if "ERROR:" in s]
+    if hibak:
+        return hibak[-1].split("ERROR:", 1)[1].strip()
+    return szoveg.splitlines()[-1] if szoveg.splitlines() else "Ismeretlen hiba."
+
+
+# ------------------------------------------------------ formátum-elemzés --
+
+# A YouTube minőségi szintje NEM azonos a pixelmagassággal: egy 21:9-es
+# ultrawide videónál a 3440x1440 az, amit a YouTube 2160p-nek (4K) hív.
+# Ezért a `format_note` mezőt tekintjük mérvadónak, és csak utána a magasságot.
+SZINT_NEVEK = {
+    4320: "8K", 2880: "5K", 2160: "4K", 1440: "2K",
+    1080: "Full HD", 720: "HD",
+}
+
+
+SZABVANYOS_SZINTEK = (144, 240, 360, 480, 720, 1080, 1440, 2160, 2880, 4320)
+
+
+def _szintre_illesztes(becsles):
+    """A becsült szintet a legközelebbi szabványos lépcsőre húzza, ha közel van.
+
+    Egy 3440x1440-es ultrawide 16:9-re vetítve 1935 - ez valójában a 2160p
+    lépcső, és a felhasználónak "4K"-ként kell látnia, nem "1935p"-ként.
+    """
+    if not becsles:
+        return 0
+    legkozelebbi = min(SZABVANYOS_SZINTEK, key=lambda sz: abs(sz - becsles))
+    if abs(legkozelebbi - becsles) <= legkozelebbi * 0.15:
+        return legkozelebbi
+    return int(becsles)
+
+
+def minoseg_szint(f):
+    """A formátum YouTube szerinti minőségi szintje (pl. 2160).
+
+    A `format_note` a mérvadó: a YouTube egy 21:9-es 3440x1440-es videót
+    2160p-nek (4K) hív, hiába 1440 a pixelmagassága."""
+    m = re.match(r"\s*(\d{3,4})p", str(f.get("format_note") or ""))
+    if m:
+        return int(m.group(1))
+    magassag = f.get("height") or 0
+    szelesseg = f.get("width") or 0
+    if not szelesseg or not magassag:
+        return magassag
+    if magassag > szelesseg:                     # álló videó (pl. Shorts)
+        return _szintre_illesztes(szelesseg)
+    if szelesseg / magassag > 1.9:               # ultrawide
+        return _szintre_illesztes(szelesseg * 9 / 16)
+    return magassag
+
+
+def protokoll_rangsor(f):
+    """https/DASH > HLS. A YouTube HLS változata ugyanaz a stream, de a
+    bitrátája hamisan magas, nincs benne byte-index, és lassabban is jön."""
+    proto = str(f.get("protocol") or "")
+    if proto.startswith("http") and "m3u8" not in proto:
+        return 2
+    if "m3u8" in proto:
+        return 0
+    return 1
+
+
+def valodi_video_formatum(f):
+    """Igazi videósáv-e? (a storyboard képsorozatokat ki kell szűrni)"""
+    if (f.get("ext") or "") == "mhtml" or "mhtml" in str(f.get("protocol") or ""):
+        return False
+    if str(f.get("format_note") or "").lower() == "storyboard":
+        return False
+    vcodec = f.get("vcodec")
+    if vcodec in ("none", "images"):
+        return False
+    return bool(f.get("height"))
+
+
+def valodi_hang_formatum(f):
+    if (f.get("ext") or "") == "mhtml":
+        return False
+    return (f.get("acodec") or "none") != "none"
+
+
+def kodek_nev(kod):
+    """'vp09.00.51.08' -> 'VP9', 'avc1.640028' -> 'H.264'."""
+    kod = (kod or "").split(".")[0].lower()
+    return {"vp09": "VP9", "vp9": "VP9", "av01": "AV1", "avc1": "H.264",
+            "avc3": "H.264", "hev1": "H.265", "hvc1": "H.265",
+            "mp4a": "AAC", "opus": "Opus", "vorbis": "Vorbis",
+            "ec-3": "E-AC3", "ac-3": "AC3"}.get(kod, kod.upper() or "?")
+
+
+def legjobb_hang(formats, mp4_baratsagos=True):
+    """A legjobb hangsáv kiválasztása.
+
+    - a külön hangsáv jobb, mint a kombinált (Twitch/egyéb oldalak miatt kell)
+    - a DRC (dinamikatömörített) változat rosszabb, csak végszükségben
+    - mp4 kimenethez az m4a/AAC a biztonságos (az Opus mp4-ben döcög)
+    """
+    jeloltek = [f for f in formats if valodi_hang_formatum(f)]
+    if not jeloltek:
+        return None
+
+    def kulcs(f):
+        csak_hang = (f.get("vcodec") or "none") == "none"
+        drc = "drc" in str(f.get("format_id") or "").lower()
+        m4a = (f.get("ext") or "") == "m4a"
+        abr = f.get("abr") or f.get("tbr") or 0
+        return (csak_hang, protokoll_rangsor(f), not drc,
+                m4a if mp4_baratsagos else True, abr)
+
+    return max(jeloltek, key=kulcs)
+
+
 def formatum_csoportositas(info):
-    """Csoportosítja a formátumokat felbontás szerint, és visszaadja a legjobb videó+audió opciókat."""
-    formats = info.get("formats", [])
-    
-    # Videó formátumok szűrése (van kép vagy van height) - beleértve kombinált formátumokat is
-    video_fmts = []
-    for f in formats:
-        has_video = f.get("vcodec", "none") != "none" or f.get("height")
-        if has_video and f.get("height"):
-            video_fmts.append(f)
-    
-    # Legjobb audió keresése (külön audió stream, vagy kombinált formátumból)
-    best_audio = None
-    for f in formats:
-        if f.get("acodec", "none") != "none":
-            abr = f.get("abr") or f.get("tbr") or 0
-            is_audio_only = f.get("vcodec", "none") == "none"
-            best_abr = (best_audio.get("abr") or best_audio.get("tbr") or 0) if best_audio else 0
-            best_is_audio_only = (best_audio.get("vcodec", "none") == "none") if best_audio else False
-            # Előnyben részesítjük a külön audió streamet
-            if best_audio is None or (is_audio_only and not best_is_audio_only) or (not (best_is_audio_only and not is_audio_only) and abr > best_abr):
-                best_audio = f
+    """A formátumlistából minőségi szintenként egy ajánlott sor.
 
-    # Felbontás szerinti csoportosítás - minden felbontásból a legjobb
-    felb_map = {}
+    Visszaad egy listát (növekvő minőség szerint) ilyen elemekkel:
+    {szint, nev, felbontas, fps, kodek, meret, meret_szoveg, format_id,
+     height, hang_id, hdr, leiras}
+    """
+    formats = info.get("formats") or []
+    video_fmts = [f for f in formats if valodi_video_formatum(f)]
+    hang = legjobb_hang(formats)
+
+    # 1. lépés: felbontásonként (szélesség x magasság x fps) egy győztes.
+    # Ugyanaz a stream ugyanis kétszer is szerepel a listában - https DASH és
+    # HLS változatban -, és a HLS-nek hamisan magas a bitrátája. Enélkül a
+    # kettő két külön "minőségként" jelenne meg.
+    rendites_map = {}
     for f in video_fmts:
-        h = f.get("height", 0)
-        tbr = f.get("tbr") or 0
-        if h not in felb_map or tbr > (felb_map[h].get("tbr") or 0):
-            felb_map[h] = f
+        kulcs = (f.get("width") or 0, f.get("height") or 0, f.get("fps") or 0)
+        # https > HLS, külön videósáv > kombinált (annak rosszabb a hangja),
+        # és csak legvégül a bitráta.
+        rang = (protokoll_rangsor(f),
+                (f.get("acodec") or "none") == "none",
+                f.get("tbr") or f.get("vbr") or 0)
+        elozo = rendites_map.get(kulcs)
+        if elozo is None or rang > elozo[0]:
+            rendites_map[kulcs] = (rang, f)
 
-    # Rendezés felbontás szerint (növekvő)
-    rendezett = sorted(felb_map.items(), key=lambda x: x[0])
+    # 2. lépés: minőségi szintenként a legnagyobb felbontású győztes.
+    szint_map = {}
+    for _, f in rendites_map.values():
+        szint = minoseg_szint(f)
+        if not szint:
+            continue
+        kulcs = ((f.get("width") or 0) * (f.get("height") or 0),
+                 f.get("fps") or 0, f.get("tbr") or f.get("vbr") or 0)
+        elozo = szint_map.get(szint)
+        if elozo is None or kulcs > elozo[0]:
+            szint_map[szint] = (kulcs, f)
 
     eredmeny = []
-    for height, f in rendezett:
-        w = f.get("width")
-        h = f.get("height", "?")
-        vcodec = f.get("vcodec") or None
-        if vcodec and vcodec != "none" and "." in vcodec:
-            vcodec = vcodec.split(".")[0]
-        if not vcodec or vcodec == "none":
-            vcodec = None
+    for szint in sorted(szint_map):
+        f = szint_map[szint][1]
+        magassag = f.get("height") or szint
+        szelesseg = f.get("width")
         fps = f.get("fps")
-        if fps and isinstance(fps, float) and fps == int(fps):
+        if isinstance(fps, float) and fps == int(fps):
             fps = int(fps)
-        tbr = f.get("tbr")
-        vbr = f.get("vbr")
-        filesize = f.get("filesize") or f.get("filesize_approx")
+        meret = f.get("filesize") or f.get("filesize_approx")
+        sajat_hang = (f.get("acodec") or "none") != "none"
+        hdr = "hdr" in str(f.get("dynamic_range") or "").lower()
 
-        # Felbontás név
-        if h == 720:
-            nev = "720p HD"
-        elif h == 1080:
-            nev = "1080p Full HD"
-        elif h == 1440:
-            nev = "1440p 2K"
-        elif h == 2160:
-            nev = "2160p 4K"
-        elif h == 4320:
-            nev = "4320p 8K"
-        else:
-            nev = f"{h}p"
-
-        # Leírás összeállítása - csak ami elérhető
-        reszek = [nev]
-        if w:
-            reszek.append(f"{w}x{h}")
-        if vcodec:
-            reszek.append(vcodec)
-        if fps:
-            reszek.append(f"{fps}fps")
-        if vbr:
-            reszek.append(f"{vbr:.0f} kbps video")
-        elif tbr:
-            reszek.append(f"{tbr:.0f} kbps")
-
-        # Méret
-        if filesize:
-            mb = filesize / (1024 * 1024)
-            if mb >= 1024:
-                reszek.append(f"~{mb/1024:.1f} GB")
-            else:
-                reszek.append(f"~{mb:.0f} MB")
-
-        # Audió infó
-        has_own_audio = f.get("acodec", "none") != "none"
-        needs_separate_audio = not has_own_audio
-        if needs_separate_audio and best_audio:
-            ac = best_audio.get("acodec", "?")
-            if ac and "." in ac:
-                ac = ac.split(".")[0]
-            abr = best_audio.get("abr") or best_audio.get("tbr") or 0
-            reszek.append(f"+ {ac} {abr:.0f}kbps audio")
-        elif has_own_audio:
-            ac = f.get("acodec", "?")
-            if ac and "." in ac:
-                ac = ac.split(".")[0]
-            abr = f.get("abr") or 0
-            if abr:
-                reszek.append(f"+ {ac} {abr:.0f}kbps audio")
-
-        leiras = "  |  ".join(reszek)
+        cimke = SZINT_NEVEK.get(szint)
+        nev = f"{szint}p" + (f"{fps}" if fps and fps > 30 else "")
+        if cimke:
+            nev = f"{cimke} · {nev}"
+        if hdr:
+            nev += " HDR"
 
         eredmeny.append({
-            "leiras": leiras,
-            "height": h,
+            "szint": szint,
+            "nev": nev,
+            "felbontas": f"{szelesseg}×{magassag}" if szelesseg else f"{magassag}p",
+            "fps": str(fps) if fps else "–",
+            "kodek": kodek_nev(f.get("vcodec")),
+            "meret": meret,
+            "meret_szoveg": meret_formazas(meret),
             "format_id": f.get("format_id"),
-            "best_audio_id": best_audio.get("format_id") if (needs_separate_audio and best_audio) else None,
+            "height": magassag,
+            "hdr": hdr,
+            "hang_id": None if sajat_hang or not hang else hang.get("format_id"),
+            "hang_leiras": hang_leiras(hang if not sajat_hang else f),
+            "leiras": (f"{nev} · {szelesseg or '?'}×{magassag} · "
+                       f"{kodek_nev(f.get('vcodec'))}"
+                       + (f" · {fps}fps" if fps else "")
+                       + f" · {meret_formazas(meret)}"),
         })
-
     return eredmeny
 
 
-class ZeneLetolto(tk.Tk):
+def hang_leiras(f):
+    if not f:
+        return "–"
+    abr = f.get("abr") or f.get("tbr") or 0
+    return f"{kodek_nev(f.get('acodec'))} {abr:.0f} kbps" if abr else kodek_nev(f.get("acodec"))
+
+
+# ------------------------------------------------------ haladás-értelmezés --
+
+# [download]  42.3% of ~  43.14GiB at    5.43MiB/s ETA 03:21
+HALADAS_MINTA = re.compile(
+    r"\[download\]\s+(\d+(?:\.\d+)?)%\s+of\s+~?\s*([\d.]+\s*\w+)"
+    r"(?:\s+at\s+([\d.]+\s*\w+/s))?(?:\s+ETA\s+([\d:]+))?", re.I)
+
+
+def haladas_ertelmezes(sor):
+    """yt-dlp haladás-sor -> (százalék, méret, sebesség, hátralévő) vagy None."""
+    m = HALADAS_MINTA.search(sor)
+    if not m:
+        return None
+    szazalek = float(m.group(1))
+    return szazalek, m.group(2), (m.group(3) or "").strip(), (m.group(4) or "").strip()
+
+
+# =============================================================== FELÜLET ====
+
+SZIN = {
+    "hatter":   "#0e1015",
+    "panel":    "#161922",
+    "panel2":   "#1d2130",
+    "mezo":     "#0b0d13",
+    "keret":    "#272c3a",
+    "keret2":   "#343a4d",
+    "szoveg":   "#e7eaf3",
+    "halvany":  "#98a2b8",
+    "halvany2": "#6b7488",
+    "kiemel":   "#4f8cff",
+    "kiemel2":  "#6d9fff",
+    "siker":    "#3ddc97",
+    "figyelem": "#f7b955",
+    "hiba":     "#ff6b6b",
+    "lila":     "#a78bfa",
+}
+
+BETU = "Segoe UI"
+
+
+class Gomb(tk.Button):
+    """Lapos, hover-effektes gomb - a tk.Button az egyetlen, aminek Windows
+    alatt megbízhatóan állítható minden színe."""
+
+    STILUSOK = {
+        "elsodleges": (SZIN["kiemel"], "#ffffff", SZIN["kiemel2"]),
+        "masodlagos": (SZIN["panel2"], SZIN["szoveg"], SZIN["keret2"]),
+        "csendes":    (SZIN["panel"], SZIN["halvany"], SZIN["panel2"]),
+        "veszely":    ("#3a2028", SZIN["hiba"], "#4d2a34"),
+        "siker":      (SZIN["siker"], "#0b2b1e", "#5ce8ac"),
+    }
+
+    def __init__(self, szulo, szoveg, parancs=None, stilus="masodlagos",
+                 meret=10, vastag=False, **kw):
+        hatter, elotr, hover = self.STILUSOK[stilus]
+        self._hatter, self._hover = hatter, hover
+        kw.setdefault("padx", 14)
+        kw.setdefault("pady", 7)
+        super().__init__(szulo, text=szoveg, command=parancs,
+                         font=(BETU, meret, "bold" if vastag else "normal"),
+                         bg=hatter, fg=elotr, activebackground=hover,
+                         activeforeground=elotr, relief="flat", bd=0,
+                         highlightthickness=0, cursor="hand2",
+                         disabledforeground=SZIN["halvany2"], **kw)
+        self.bind("<Enter>", self._be)
+        self.bind("<Leave>", self._ki)
+
+    def configure(self, cnf=None, **kw):
+        # Letiltva a saját (pl. kék) háttér félrevezető: tompítjuk, hogy
+        # ránézésre is látszódjon, hogy a gomb most nem használható.
+        if "state" in kw and "bg" not in kw:
+            kw["bg"] = (SZIN["panel2"] if str(kw["state"]) == "disabled"
+                        else self._hatter)
+        return super().configure(cnf, **kw)
+
+    config = configure
+
+    def _be(self, _=None):
+        if str(self["state"]) != "disabled":
+            self.config(bg=self._hover)
+
+    def _ki(self, _=None):
+        self.config(bg=self._hatter)
+
+    def stilus_valt(self, stilus):
+        hatter, elotr, hover = self.STILUSOK[stilus]
+        self._hatter, self._hover = hatter, hover
+        self.config(bg=hatter, fg=elotr, activebackground=hover,
+                    activeforeground=elotr)
+
+
+class Mezo(tk.Frame):
+    """Beviteli mező fókuszgyűrűvel (a keretet a szülő Frame adja)."""
+
+    def __init__(self, szulo, szoveg_valtozo=None, meret=11, mono=False, **kw):
+        super().__init__(szulo, bg=SZIN["keret"], padx=1, pady=1,
+                         highlightthickness=0)
+        self.entry = tk.Entry(
+            self, textvariable=szoveg_valtozo, relief="flat", bd=0,
+            font=("Consolas" if mono else BETU, meret),
+            bg=SZIN["mezo"], fg=SZIN["szoveg"], insertbackground=SZIN["kiemel"],
+            disabledbackground=SZIN["panel"], disabledforeground=SZIN["halvany2"],
+            selectbackground=SZIN["kiemel"], selectforeground="#ffffff", **kw)
+        self.entry.pack(fill="both", expand=True, ipady=6, padx=8)
+        self.entry.bind("<FocusIn>", lambda e: self.config(bg=SZIN["kiemel"]))
+        self.entry.bind("<FocusOut>", lambda e: self.config(bg=SZIN["keret"]))
+
+    # kényelmi átvezetések
+    def get(self):
+        return self.entry.get()
+
+    def set(self, ertek):
+        allapot = str(self.entry["state"])
+        self.entry.config(state="normal")
+        self.entry.delete(0, "end")
+        self.entry.insert(0, ertek)
+        self.entry.config(state=allapot)
+
+    def allapot(self, allapot):
+        self.entry.config(state=allapot)
+
+
+class TartomanySav(tk.Canvas):
+    """Két fogantyús csúszka: ezzel jelöli ki a felhasználó a részletet.
+
+    A Tk-ban nincs ilyen elem, ezért vászonra rajzoljuk. A két fogantyú nem
+    tudja átlépni egymást, és mindig marad köztük legalább egy másodperc.
+    """
+
+    FOGANTYU = 9
+    PEREM = 18
+    SAV_Y = 28
+
+    def __init__(self, szulo, valtozas=None):
+        super().__init__(szulo, bg=SZIN["panel"], height=62, highlightthickness=0,
+                         bd=0)
+        self.hossz = 0
+        self.kezd = 0
+        self.veg = 0
+        self.aktiv = False
+        self._huzott = None
+        self._valtozas = valtozas
+
+        self.bind("<Configure>", lambda e: self._rajzol())
+        self.bind("<Button-1>", self._lenyomas)
+        self.bind("<B1-Motion>", self._huzas)
+        self.bind("<ButtonRelease-1>", self._elenged)
+        self.bind("<Key-Left>", lambda e: self._leptet(-1))
+        self.bind("<Key-Right>", lambda e: self._leptet(1))
+
+    # -- állapot --
+
+    def beallit(self, hossz, kezd=None, veg=None, ertesit=True):
+        self.hossz = max(int(hossz or 0), 0)
+        if self.hossz:
+            self.kezd = max(0, min(int(kezd if kezd is not None else 0), self.hossz - 1))
+            self.veg = max(self.kezd + 1,
+                           min(int(veg if veg is not None else self.hossz), self.hossz))
+        else:
+            self.kezd = self.veg = 0
+        self._rajzol()
+        if ertesit and self._valtozas:
+            self._valtozas(self.kezd, self.veg)
+
+    def engedelyez(self, aktiv):
+        self.aktiv = bool(aktiv) and self.hossz > 0
+        self.config(cursor="hand2" if self.aktiv else "")
+        self._rajzol()
+
+    # -- koordináta-átváltás --
+
+    def _x(self, mp):
+        szel = max(self.winfo_width(), 2 * self.PEREM + 10)
+        if not self.hossz:
+            return self.PEREM
+        return self.PEREM + (szel - 2 * self.PEREM) * mp / self.hossz
+
+    def _mp(self, x):
+        szel = max(self.winfo_width(), 2 * self.PEREM + 10)
+        arany = (x - self.PEREM) / max(szel - 2 * self.PEREM, 1)
+        return int(round(max(0.0, min(1.0, arany)) * self.hossz))
+
+    # -- egérkezelés --
+
+    def _lenyomas(self, esemeny):
+        if not self.aktiv:
+            return
+        self.focus_set()
+        tav_kezd = abs(esemeny.x - self._x(self.kezd))
+        tav_veg = abs(esemeny.x - self._x(self.veg))
+        self._huzott = "kezd" if tav_kezd <= tav_veg else "veg"
+        self._huzas(esemeny)
+
+    def _huzas(self, esemeny):
+        if not self.aktiv or not self._huzott:
+            return
+        ertek = self._mp(esemeny.x)
+        if self._huzott == "kezd":
+            self.kezd = min(ertek, self.veg - 1)
+        else:
+            self.veg = max(ertek, self.kezd + 1)
+        self._rajzol()
+        if self._valtozas:
+            self._valtozas(self.kezd, self.veg)
+
+    def _elenged(self, _=None):
+        self._huzott = None
+
+    def _leptet(self, irany):
+        if not self.aktiv:
+            return
+        lepes = max(1, self.hossz // 200) * irany
+        if self._huzott == "veg":
+            self.veg = max(self.kezd + 1, min(self.hossz, self.veg + lepes))
+        else:
+            self.kezd = max(0, min(self.veg - 1, self.kezd + lepes))
+        self._rajzol()
+        if self._valtozas:
+            self._valtozas(self.kezd, self.veg)
+
+    # -- rajzolás --
+
+    def _rajzol(self):
+        self.delete("all")
+        szel = self.winfo_width()
+        if szel < 30:
+            return
+        y = self.SAV_Y
+        bal, jobb = self.PEREM, szel - self.PEREM
+        sav_szin = SZIN["panel2"] if self.aktiv else "#191c25"
+        self.create_line(bal, y, jobb, y, fill=sav_szin, width=6,
+                         capstyle="round")
+        if not self.hossz:
+            self.create_text(szel / 2, y - 16, text="előbb elemezd a videót",
+                             fill=SZIN["halvany2"], font=(BETU, 8))
+            return
+
+        x1, x2 = self._x(self.kezd), self._x(self.veg)
+        self.create_line(x1, y, x2, y, width=6, capstyle="round",
+                         fill=SZIN["kiemel"] if self.aktiv else SZIN["keret2"])
+
+        # feliratok: középen a szakasz hossza, a fogantyúk alatt a két időpont
+        szoveg_szin = SZIN["szoveg"] if self.aktiv else SZIN["halvany2"]
+        self.create_text(min(max((x1 + x2) / 2, bal + 24), jobb - 24), y - 17,
+                         text=ido_formazas(self.veg - self.kezd),
+                         fill=SZIN["kiemel"] if self.aktiv else SZIN["halvany2"],
+                         font=(BETU, 8, "bold"))
+        # Ha a két fogantyú közel van, a feliratok egymásra csúsznának: ilyenkor
+        # kifelé húzzuk őket.
+        szuk = (x2 - x1) < 110
+        self.create_text(max(x1 - (8 if szuk else 0), bal), y + 17,
+                         text=ido_formazas(self.kezd), fill=szoveg_szin,
+                         font=("Consolas", 8), anchor="e" if szuk else "center")
+        self.create_text(min(x2 + (8 if szuk else 0), jobb), y + 17,
+                         text=ido_formazas(self.veg), fill=szoveg_szin,
+                         font=("Consolas", 8), anchor="w" if szuk else "center")
+        for x in (x1, x2):
+            r = self.FOGANTYU
+            self.create_oval(x - r, y - r, x + r, y + r,
+                             fill=SZIN["szoveg"] if self.aktiv else SZIN["keret2"],
+                             outline=SZIN["kiemel"] if self.aktiv else SZIN["keret"],
+                             width=2)
+
+
+class Alkalmazas(tk.Tk):
+
     def __init__(self):
         super().__init__()
-        self.title("YouTube Letöltő")
-        self.geometry("780x730")
-        self.resizable(True, True)
-        self.minsize(680, 600)
-        self.configure(bg="#1e1e2e")
+        self.beallitas = beallitasok_betoltes()
 
-        self.letoltes_mappa = os.path.join(os.path.expanduser("~"), "Downloads", "YTLetolto")
-        self.fut = False
-        self.letolt_fut = False
+        self.title(f"{PROGRAM_NEV}  ·  v{VERZIO} (build {BUILD_SZAM})")
+        self.configure(bg=SZIN["hatter"])
+        self._ablak_meret()
+        self._ikon_beallitas()
+
+        # --- állapot ---
         self.formatumok = []
+        self.info = None
+        self.lekerdezett_url = None
+        self.video_hossz = None
+        self.utolso_mappa = None
+        self.elemezve = False
+        self.fut = False                  # bármilyen művelet
+        self.letolt_fut = False           # kifejezetten letöltés
         self.process = None
         self._megszakitva = False
         self._destroyed = False
-        self.video_hossz = None
-        self.lekerdezett_url = None
+        self._elemzes_idozito = None
+        self._elozo_url_szoveg = ""
+        self._haladas_utolso = 0.0
+        self._boritokep = None            # PhotoImage referencia kell, hogy megmaradjon
 
+        self._stilus_beallitas()
         self._ui_felepites()
-        self.protocol("WM_DELETE_WINDOW", self._kilep)
-        threading.Thread(target=self._init_eszközök, daemon=True).start()
+        self._beallitasok_alkalmazasa()
 
-    def _kilep(self):
-        self._destroyed = True
-        if self.process and self.process.poll() is None:
-            self.process.terminate()
-            try:
-                self.process.wait(timeout=3)
-            except Exception:
-                self.process.kill()
-        self.destroy()
+        self.protocol("WM_DELETE_WINDOW", self._kilep)
+        threading.Thread(target=self._init_eszkozok, daemon=True).start()
+
+    # ------------------------------------------------------------ felület --
+
+    def _ikon_beallitas(self):
+        """Ablak- és tálcaikon. Exe-ből futva a PyInstaller kicsomagolt
+        mappájából, forrásból a szkript mellől."""
+        alap = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+        for nev in ("icon_youtube_letolto.ico",):
+            utvonal = os.path.join(alap, nev)
+            if os.path.isfile(utvonal):
+                try:
+                    self.iconbitmap(utvonal)
+                    return
+                except tk.TclError as e:
+                    fajlba_naplo(f"ikon betöltése sikertelen: {e}")
+
+    def _ablak_meret(self):
+        sz = min(1000, self.winfo_screenwidth() - 80)
+        m = min(950, self.winfo_screenheight() - 110)
+        self.geometry(f"{max(sz, 860)}x{max(m, 620)}")
+        # A minimum azért kell, hogy a napló és a haladásjelző soha ne
+        # szoruljon ki az ablakból (kis ablakban korábban eltűnt).
+        self.minsize(840, 600)
+
+    def _stilus_beallitas(self):
+        st = ttk.Style(self)
+        st.theme_use("clam")
+
+        st.configure("Treeview",
+                     background=SZIN["mezo"], fieldbackground=SZIN["mezo"],
+                     foreground=SZIN["szoveg"], borderwidth=0, relief="flat",
+                     rowheight=30, font=(BETU, 10))
+        st.map("Treeview",
+               background=[("selected", SZIN["kiemel"])],
+               foreground=[("selected", "#ffffff")])
+        st.configure("Treeview.Heading",
+                     background=SZIN["panel2"], foreground=SZIN["halvany"],
+                     relief="flat", borderwidth=0, padding=(10, 7),
+                     font=(BETU, 9, "bold"))
+        st.map("Treeview.Heading", background=[("active", SZIN["keret2"])])
+        st.layout("Minoseg.Treeview", st.layout("Treeview"))
+
+        st.configure("Fo.Horizontal.TProgressbar",
+                     troughcolor=SZIN["panel2"], bordercolor=SZIN["panel2"],
+                     background=SZIN["kiemel"], lightcolor=SZIN["kiemel"],
+                     darkcolor=SZIN["kiemel"], thickness=10)
+        st.configure("Siker.Horizontal.TProgressbar",
+                     troughcolor=SZIN["panel2"], bordercolor=SZIN["panel2"],
+                     background=SZIN["siker"], lightcolor=SZIN["siker"],
+                     darkcolor=SZIN["siker"], thickness=10)
+
+        # Nyilak nélküli, keskeny görgetősáv - a rendszer alapértelmezett
+        # nyilai világosak, és elrontanák a sötét felületet.
+        st.layout("Vertical.TScrollbar",
+                  [("Vertical.Scrollbar.trough", {"sticky": "ns", "children": [
+                      ("Vertical.Scrollbar.thumb",
+                       {"expand": "1", "sticky": "nswe"})]})])
+        st.configure("Vertical.TScrollbar",
+                     background=SZIN["keret2"], troughcolor=SZIN["mezo"],
+                     bordercolor=SZIN["mezo"], darkcolor=SZIN["keret2"],
+                     lightcolor=SZIN["keret2"], arrowcolor=SZIN["halvany"],
+                     relief="flat", borderwidth=0, width=10)
+        st.map("Vertical.TScrollbar",
+               background=[("active", SZIN["halvany2"])])
+
+    def _cimke(self, szulo, szoveg, meret=10, szin=None, vastag=False, **kw):
+        return tk.Label(szulo, text=szoveg, bg=szulo["bg"],
+                        fg=szin or SZIN["halvany"],
+                        font=(BETU, meret, "bold" if vastag else "normal"), **kw)
+
+    def _kartya(self, szulo):
+        """Panel 1 pixeles kerettel - ettől tagolt a felület."""
+        kulso = tk.Frame(szulo, bg=SZIN["keret"], padx=1, pady=1)
+        belso = tk.Frame(kulso, bg=SZIN["panel"])
+        belso.pack(fill="both", expand=True)
+        kulso.belso = belso
+        return kulso
 
     def _ui_felepites(self):
-        stilus = {"bg": "#1e1e2e", "fg": "#cdd6f4", "font": ("Segoe UI", 11)}
-        cb_stilus = {"font": ("Segoe UI", 11), "bg": "#1e1e2e", "fg": "#cdd6f4",
-                     "selectcolor": "#313244", "activebackground": "#1e1e2e",
-                     "activeforeground": "#cdd6f4", "cursor": "hand2"}
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(1, weight=4, minsize=240)   # törzs
+        self.grid_rowconfigure(3, weight=1, minsize=124)   # napló
 
-        tk.Label(self, text="YouTube Letöltő", font=("Segoe UI", 16, "bold"),
-                 bg="#1e1e2e", fg="#89b4fa").pack(pady=(14, 8))
+        self._fejlec_epites()
+        self._torzs_epites()
+        self._akciosav_epites()
+        self._naplo_epites()
 
-        # URL mező + Lekérdezés gomb
-        url_keret = tk.Frame(self, bg="#1e1e2e")
-        url_keret.pack(fill="x", padx=20)
-        tk.Label(url_keret, text="YouTube URL:", **stilus).pack(anchor="w")
-        url_sor = tk.Frame(url_keret, bg="#1e1e2e")
-        url_sor.pack(fill="x", pady=(2, 8))
-        self.url_mezo = tk.Entry(url_sor, font=("Segoe UI", 12), bg="#313244", fg="#cdd6f4",
-                                  insertbackground="#cdd6f4", relief="flat", bd=6)
-        self.url_mezo.pack(side="left", fill="x", expand=True)
-        self.url_mezo.bind("<Return>", lambda e: self._formatumok_lekerese())
-        self.lekerdezes_gomb = tk.Button(url_sor, text="🔍 Lekérdezés", font=("Segoe UI", 11, "bold"),
-                                          bg="#a6e3a1", fg="#1e1e2e", activebackground="#94e2d5",
-                                          relief="flat", bd=0, cursor="hand2",
-                                          command=self._formatumok_lekerese)
-        self.lekerdezes_gomb.pack(side="right", padx=(8, 0), ipady=4)
+    # -- fejléc --------------------------------------------------------------
 
-        # Mappa választó
-        mappa_keret = tk.Frame(self, bg="#1e1e2e")
-        mappa_keret.pack(fill="x", padx=20)
-        tk.Label(mappa_keret, text="Mentés helye:", **stilus).pack(anchor="w")
-        sor = tk.Frame(mappa_keret, bg="#1e1e2e")
-        sor.pack(fill="x", pady=(2, 6))
-        self.mappa_var = tk.StringVar(value=self.letoltes_mappa)
-        tk.Entry(sor, textvariable=self.mappa_var, font=("Segoe UI", 10), bg="#313244",
-                 fg="#cdd6f4", insertbackground="#cdd6f4", relief="flat", bd=6).pack(side="left", fill="x", expand=True)
-        tk.Button(sor, text="📁", font=("Segoe UI", 12), bg="#45475a", fg="#cdd6f4",
-                  relief="flat", command=self._mappa_valasztas, cursor="hand2").pack(side="right", padx=(6, 0))
+    def _fejlec_epites(self):
+        keret = tk.Frame(self, bg=SZIN["panel"], height=58)
+        keret.grid(row=0, column=0, sticky="ew")
+        keret.grid_propagate(False)
 
-        # Mód választó (Zene / Videó)
-        mod_keret = tk.Frame(self, bg="#1e1e2e")
-        mod_keret.pack(fill="x", padx=20, pady=(4, 0))
-        self.mod_var = tk.StringVar(value="zene")
-        mod_sor = tk.Frame(mod_keret, bg="#1e1e2e")
-        mod_sor.pack(anchor="w")
-        tk.Radiobutton(mod_sor, text="🎵 Zene (MP3)", variable=self.mod_var, value="zene",
-                       command=self._mod_valtozott, **cb_stilus).pack(side="left", padx=(0, 16))
-        tk.Radiobutton(mod_sor, text="🎬 Videó (MP4)", variable=self.mod_var, value="video",
-                       command=self._mod_valtozott, **cb_stilus).pack(side="left", padx=(0, 16))
-        tk.Radiobutton(mod_sor, text="🥽 VR 3D (SBS)", variable=self.mod_var, value="vr",
-                       command=self._mod_valtozott, **cb_stilus).pack(side="left")
+        bal = tk.Frame(keret, bg=SZIN["panel"])
+        bal.pack(side="left", padx=(20, 0), pady=12)
+        tk.Frame(bal, bg=SZIN["kiemel"], width=4).pack(side="left", fill="y",
+                                                       pady=2, padx=(0, 12))
+        self._cimke(bal, "YouTube Letöltő", 15, SZIN["szoveg"], True).pack(side="left")
 
-        # Playlist checkbox
-        self.playlist_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(self, text="Playlist letöltése", variable=self.playlist_var,
-                       **cb_stilus).pack(anchor="w", padx=20)
+        jobb = tk.Frame(keret, bg=SZIN["panel"])
+        jobb.pack(side="right", padx=20, pady=12)
+        self.allapot_pont = tk.Label(jobb, text="●", bg=SZIN["panel"],
+                                     fg=SZIN["figyelem"], font=(BETU, 11))
+        self.allapot_pont.pack(side="left", padx=(0, 6))
+        self.allapot_cimke = self._cimke(jobb, "indulás…", 10, SZIN["halvany"])
+        self.allapot_cimke.pack(side="left")
 
-        # Időintervallum (részlet letöltése)
-        szakasz_keret = tk.Frame(self, bg="#1e1e2e")
-        szakasz_keret.pack(fill="x", padx=20)
-        self.szakasz_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(szakasz_keret, text="✂️ Csak egy szakasz letöltése",
-                       variable=self.szakasz_var, command=self._szakasz_valtozott,
-                       **cb_stilus).pack(anchor="w")
+        tk.Frame(self, bg=SZIN["keret"], height=1).grid(row=0, column=0, sticky="sew")
 
-        szakasz_sor = tk.Frame(szakasz_keret, bg="#1e1e2e")
-        szakasz_sor.pack(anchor="w", padx=(24, 0), pady=(0, 4))
-        mezo_stilus = {"font": ("Consolas", 11), "bg": "#313244", "fg": "#cdd6f4",
-                       "insertbackground": "#cdd6f4", "relief": "flat", "bd": 5,
-                       "width": 9, "justify": "center",
-                       "disabledbackground": "#26263a", "disabledforeground": "#585b70"}
-        tk.Label(szakasz_sor, text="Ettől:", **stilus).pack(side="left")
-        self.szakasz_kezd = tk.Entry(szakasz_sor, state="disabled", **mezo_stilus)
-        self.szakasz_kezd.pack(side="left", padx=(6, 14))
-        tk.Label(szakasz_sor, text="Eddig:", **stilus).pack(side="left")
-        self.szakasz_veg = tk.Entry(szakasz_sor, state="disabled", **mezo_stilus)
-        self.szakasz_veg.pack(side="left", padx=(6, 14))
-        self.hossz_cimke = tk.Label(szakasz_sor, text="pl. 3:00:00 → 3:20:00",
-                                    bg="#1e1e2e", fg="#6c7086", font=("Segoe UI", 10))
-        self.hossz_cimke.pack(side="left")
+    def _allapot(self, szoveg, szin="halvany"):
+        def frissit():
+            self.allapot_cimke.config(text=szoveg, fg=SZIN[szin])
+            self.allapot_pont.config(fg=SZIN[szin if szin != "halvany" else "halvany2"])
+        self._fo_szalon(frissit)
 
-        tk.Label(szakasz_keret,
-                 text="Formátum: óra:perc:mp (3:00:00) · perc:mp (20:15) · másodperc (90)",
-                 bg="#1e1e2e", fg="#6c7086", font=("Segoe UI", 9)).pack(anchor="w", padx=(24, 0))
+    # -- törzs ---------------------------------------------------------------
 
-        # Formátum választó keret (videó módban, lekérdezés után jelenik meg)
-        self.fmt_keret = tk.Frame(self, bg="#1e1e2e")
-        tk.Label(self.fmt_keret, text="Elérhető felbontások:", **stilus).pack(anchor="w")
+    def _torzs_epites(self):
+        self.torzs = torzs = tk.Frame(self, bg=SZIN["hatter"], padx=20, pady=14)
+        torzs.grid(row=1, column=0, sticky="nsew")
+        torzs.grid_columnconfigure(0, weight=1)
+        torzs.grid_rowconfigure(3, weight=1)          # a minőséglista nyúlik
 
-        # Scrollable lista
-        self.fmt_lista_keret = tk.Frame(self.fmt_keret, bg="#181825")
-        self.fmt_lista_keret.pack(fill="both", expand=True, pady=(4, 0))
+        self._link_sor(torzs, 0)
+        self._info_kartya(torzs, 1)
+        self._mod_sor(torzs, 2)
+        self._minoseg_lista(torzs, 3)
+        self._szakasz_sor(torzs, 4)
+        self._mappa_sor(torzs, 5)
 
-        self.fmt_canvas = tk.Canvas(self.fmt_lista_keret, bg="#181825", highlightthickness=0)
-        self.fmt_scrollbar = tk.Scrollbar(self.fmt_lista_keret, orient="vertical", command=self.fmt_canvas.yview)
-        self.fmt_belso = tk.Frame(self.fmt_canvas, bg="#181825")
-        self.fmt_belso.bind("<Configure>", lambda e: self.fmt_canvas.configure(scrollregion=self.fmt_canvas.bbox("all")))
-        self.fmt_canvas.create_window((0, 0), window=self.fmt_belso, anchor="nw")
-        self.fmt_canvas.configure(yscrollcommand=self.fmt_scrollbar.set)
-        self.fmt_canvas.pack(side="left", fill="both", expand=True)
-        self.fmt_scrollbar.pack(side="right", fill="y")
+    def _link_sor(self, szulo, sor):
+        keret = tk.Frame(szulo, bg=SZIN["hatter"])
+        keret.grid(row=sor, column=0, sticky="ew")
+        keret.grid_columnconfigure(0, weight=1)
 
-        # Egérgörgő támogatás
-        def _on_mousewheel(event):
-            self.fmt_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-        self.fmt_canvas.bind("<MouseWheel>", _on_mousewheel)
-        self.fmt_belso.bind("<MouseWheel>", _on_mousewheel)
+        self._cimke(keret, "VIDEÓ LINKJE", 8, SZIN["halvany2"], True).grid(
+            row=0, column=0, sticky="w", pady=(0, 5))
 
-        self.fmt_valasztas = tk.StringVar()
+        bal = tk.Frame(keret, bg=SZIN["hatter"])
+        bal.grid(row=1, column=0, sticky="ew")
+        self.url_mezo = Mezo(bal, meret=11)
+        self.url_mezo.pack(fill="x")
+        self.url_mezo.entry.bind("<Return>", lambda e: self._elemzes_inditasa())
+        self.url_mezo.entry.bind("<KeyRelease>", self._url_valtozott)
+        self.url_mezo.entry.bind("<<Paste>>",
+                                 lambda e: self.after(30, self._url_valtozott))
 
-        # Letöltés gomb
-        self.gomb = tk.Button(self, text="⬇  Letöltés", font=("Segoe UI", 13, "bold"),
-                              bg="#89b4fa", fg="#1e1e2e", activebackground="#74c7ec",
-                              relief="flat", bd=0, cursor="hand2", height=1,
-                              command=self._letoltes_inditasa)
-        self.gomb.pack(pady=8)
+        gombok = tk.Frame(keret, bg=SZIN["hatter"])
+        gombok.grid(row=1, column=1, sticky="e", padx=(8, 0))
+        Gomb(gombok, "Beillesztés", self._vagolap_beillesztes,
+             "masodlagos").pack(side="left")
+        self.elemzes_gomb = Gomb(gombok, "Elemzés", self._elemzes_inditasa,
+                                 "elsodleges", vastag=True)
+        self.elemzes_gomb.pack(side="left", padx=(6, 0))
 
-        # Napló
-        naplo_fejlec = tk.Frame(self, bg="#1e1e2e")
-        naplo_fejlec.pack(fill="x", padx=20)
-        tk.Label(naplo_fejlec, text="Napló:", **stilus).pack(side="left")
-        tk.Button(naplo_fejlec, text="📄 Naplófájl megnyitása", font=("Segoe UI", 9),
-                  bg="#45475a", fg="#cdd6f4", activebackground="#585b70",
-                  relief="flat", bd=0, cursor="hand2",
-                  command=self._naplo_megnyitas).pack(side="right", ipadx=6)
+    def _info_kartya(self, szulo, sor):
+        self.info_kartya = self._kartya(szulo)
+        belso = self.info_kartya.belso
+        belso.configure(padx=12, pady=10)
 
-        self.naplo = tk.Text(self, height=6, font=("Consolas", 10), bg="#181825", fg="#a6adc8",
-                             relief="flat", bd=8, state="disabled", wrap="word")
-        self.naplo.pack(fill="both", expand=True, padx=20, pady=(2, 14))
+        self.kep_cimke = tk.Label(belso, bg=SZIN["panel2"], width=17, height=4,
+                                  text="🎬", fg=SZIN["halvany2"], font=(BETU, 16))
+        self.kep_cimke.pack(side="left", padx=(0, 14))
 
-    def _szakasz_valtozott(self):
-        allapot = "normal" if self.szakasz_var.get() else "disabled"
-        self.szakasz_kezd.config(state=allapot)
-        self.szakasz_veg.config(state=allapot)
-        if self.szakasz_var.get():
-            # Ha üresek a mezők, töltsük ki a teljes hosszal
-            if not self.szakasz_kezd.get().strip():
-                self.szakasz_kezd.insert(0, "0:00")
-            if not self.szakasz_veg.get().strip() and self.video_hossz:
-                self.szakasz_veg.insert(0, ido_formazas(self.video_hossz))
-            self.szakasz_kezd.focus_set()
+        szoveges = tk.Frame(belso, bg=SZIN["panel"])
+        szoveges.pack(side="left", fill="both", expand=True)
+        self.cim_cimke = self._cimke(szoveges, "", 11, SZIN["szoveg"], True,
+                                     anchor="w", justify="left", wraplength=700)
+        self.cim_cimke.pack(fill="x")
+        self.alcim_cimke = self._cimke(szoveges, "", 9, SZIN["halvany"],
+                                       anchor="w", justify="left")
+        self.alcim_cimke.pack(fill="x", pady=(3, 0))
+        self.jelveny_sor = tk.Frame(szoveges, bg=SZIN["panel"])
+        self.jelveny_sor.pack(fill="x", pady=(6, 0))
 
-    def _hossz_kiiras(self):
-        if self.video_hossz:
-            self.hossz_cimke.config(
-                text=f"Videó hossza: {ido_formazas(self.video_hossz)}", fg="#a6e3a1")
+        self._info_sor = sor          # a grid csak elemzés után jelenik meg
+
+    def _jelveny(self, szoveg, szin):
+        keret = tk.Frame(self.jelveny_sor, bg=SZIN["panel2"], padx=8, pady=3)
+        keret.pack(side="left", padx=(0, 6))
+        tk.Label(keret, text=szoveg, bg=SZIN["panel2"], fg=szin,
+                 font=(BETU, 8, "bold")).pack()
+
+    def _mod_sor(self, szulo, sor):
+        keret = tk.Frame(szulo, bg=SZIN["hatter"])
+        keret.grid(row=sor, column=0, sticky="ew", pady=(10, 0))
+
+        self._cimke(keret, "MIT TÖLTSÜNK LE?", 8, SZIN["halvany2"], True).pack(
+            anchor="w", pady=(0, 5))
+
+        valaszto = tk.Frame(keret, bg=SZIN["keret"], padx=1, pady=1)
+        valaszto.pack(anchor="w")
+        belso = tk.Frame(valaszto, bg=SZIN["panel"])
+        belso.pack()
+
+        self.mod = "video"
+        self.mod_gombok = {}
+        for ertek, szoveg in (("zene", "🎵  Zene (MP3)"),
+                              ("video", "🎬  Videó (MP4)"),
+                              ("vr", "🥽  VR 3D (SBS)")):
+            g = tk.Button(belso, text=szoveg, font=(BETU, 10),
+                          relief="flat", bd=0, highlightthickness=0,
+                          cursor="hand2", padx=18, pady=8,
+                          command=lambda e=ertek: self._mod_valtas(e))
+            g.pack(side="left")
+            self.mod_gombok[ertek] = g
+
+    def _mod_valtas(self, uj):
+        self.mod = uj
+        el = getattr(self, "elemezve", False)
+        for ertek, gomb in self.mod_gombok.items():
+            aktiv = ertek == uj
+            if aktiv:
+                hatter = SZIN["kiemel"] if el else SZIN["keret2"]
+                elotr = "#ffffff" if el else SZIN["halvany2"]
+            else:
+                hatter = SZIN["panel"]
+                elotr = SZIN["halvany"] if el else SZIN["halvany2"]
+            gomb.config(bg=hatter, fg=elotr,
+                        activebackground=SZIN["kiemel2"] if aktiv else SZIN["panel2"],
+                        activeforeground="#ffffff" if aktiv else SZIN["szoveg"],
+                        disabledforeground=elotr,
+                        font=(BETU, 10, "bold" if aktiv else "normal"))
+        self._minoseg_lathatosag()
+        self._minoseg_osszefoglalo()
+
+    def _szakasz_sor(self, szulo, sor):
+        """Részlet-kijelölő: kapcsoló + csúszka + két időmező (kétirányban
+        szinkronban)."""
+        kartya = self._kartya(szulo)
+        kartya.grid(row=sor, column=0, sticky="ew", pady=(10, 0))
+        belso = kartya.belso
+        belso.configure(padx=12, pady=10)
+        self.szakasz_kartya = kartya
+
+        fej = tk.Frame(belso, bg=SZIN["panel"])
+        fej.pack(fill="x")
+        self.szakasz_valtozo = tk.BooleanVar(value=False)
+        self.szakasz_kapcsolo = tk.Checkbutton(
+            fej, text="  Csak egy részlet letöltése", variable=self.szakasz_valtozo,
+            command=self._szakasz_valtozott, bg=SZIN["panel"],
+            activebackground=SZIN["panel"], fg=SZIN["szoveg"],
+            activeforeground=SZIN["szoveg"], selectcolor=SZIN["panel2"], bd=0,
+            highlightthickness=0, cursor="hand2", font=(BETU, 10, "bold"))
+        self.szakasz_kapcsolo.pack(side="left")
+
+        mezok = tk.Frame(fej, bg=SZIN["panel"])
+        mezok.pack(side="right")
+        self.szakasz_kezd = Mezo(mezok, meret=10, mono=True, width=8, justify="center")
+        self.szakasz_kezd.pack(side="left")
+        self._cimke(mezok, "→", 11, SZIN["halvany2"]).pack(side="left", padx=6)
+        self.szakasz_veg = Mezo(mezok, meret=10, mono=True, width=8, justify="center")
+        self.szakasz_veg.pack(side="left")
+        for mezo in (self.szakasz_kezd, self.szakasz_veg):
+            mezo.allapot("disabled")
+            mezo.entry.bind("<KeyRelease>", self._szakasz_mezo_valtozott)
+            mezo.entry.bind("<FocusOut>", self._szakasz_mezo_valtozott)
+
+        self.szakasz_sav = TartomanySav(belso, valtozas=self._szakasz_csuszka)
+        self.szakasz_sav.pack(fill="x", pady=(6, 0))
+        self._szakasz_frissul = False
+
+    def _mappa_sor(self, szulo, sor):
+        keret = tk.Frame(szulo, bg=SZIN["hatter"])
+        keret.grid(row=sor, column=0, sticky="ew", pady=(10, 0))
+        keret.grid_columnconfigure(1, weight=1)
+
+        fej = tk.Frame(keret, bg=SZIN["hatter"])
+        fej.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 5))
+        self._cimke(fej, "MENTÉS IDE", 8, SZIN["halvany2"], True).pack(side="left")
+        self.playlist_valtozo = tk.BooleanVar(value=False)
+        self.playlist_kapcsolo = tk.Checkbutton(
+            fej, text="  Teljes lejátszási lista letöltése",
+            variable=self.playlist_valtozo,
+            bg=SZIN["hatter"], activebackground=SZIN["hatter"], fg=SZIN["halvany"],
+            activeforeground=SZIN["szoveg"], selectcolor=SZIN["panel2"], bd=0,
+            highlightthickness=0, cursor="hand2", font=(BETU, 9))
+        self.playlist_kapcsolo.pack(side="right")
+
+        self.mappa_valtozo = tk.StringVar(
+            value=os.path.join(os.path.expanduser("~"), "Downloads", "YTLetolto"))
+        self.mappa_mezo = Mezo(keret, self.mappa_valtozo, meret=9)
+        self.mappa_mezo.grid(row=1, column=0, columnspan=2, sticky="ew")
+        Gomb(keret, "Tallózás", self._mappa_valasztas, "masodlagos", meret=9).grid(
+            row=1, column=2, padx=(6, 0))
+
+    # -- részlet: csúszka és mezők kétirányú szinkronja --
+
+    def _szakasz_csuszka(self, kezd, veg):
+        if self._szakasz_frissul:
+            return
+        self._szakasz_frissul = True
+        try:
+            self.szakasz_kezd.set(ido_formazas(kezd))
+            self.szakasz_veg.set(ido_formazas(veg))
+        finally:
+            self._szakasz_frissul = False
+
+    def _szakasz_mezo_valtozott(self, _=None):
+        if self._szakasz_frissul or not self.szakasz_valtozo.get():
+            return
+        kezd = ido_ertelmezes(self.szakasz_kezd.get())
+        veg = ido_ertelmezes(self.szakasz_veg.get())
+        if kezd is None or veg is None or not self.video_hossz:
+            return
+        self._szakasz_frissul = True
+        try:
+            self.szakasz_sav.beallit(self.video_hossz, kezd, veg, ertesit=False)
+        finally:
+            self._szakasz_frissul = False
+
+    def _minoseg_lista(self, szulo, sor):
+        self.minoseg_keret = tk.Frame(szulo, bg=SZIN["hatter"])
+        self.minoseg_keret.grid(row=sor, column=0, sticky="nsew", pady=(10, 0))
+        self.minoseg_keret.grid_columnconfigure(0, weight=1)
+        self.minoseg_keret.grid_rowconfigure(1, weight=1)
+
+        fej = tk.Frame(self.minoseg_keret, bg=SZIN["hatter"])
+        fej.grid(row=0, column=0, sticky="ew", pady=(0, 5))
+        self._cimke(fej, "MINŐSÉG", 8, SZIN["halvany2"], True).pack(side="left")
+        self.minoseg_info = self._cimke(fej, "", 9, SZIN["halvany"])
+        self.minoseg_info.pack(side="right")
+
+        doboz = tk.Frame(self.minoseg_keret, bg=SZIN["keret"], padx=1, pady=1)
+        doboz.grid(row=1, column=0, sticky="nsew")
+        doboz.grid_columnconfigure(0, weight=1)
+        doboz.grid_rowconfigure(0, weight=1)
+
+        oszlopok = ("nev", "felbontas", "fps", "kodek", "meret")
+        self.fa = ttk.Treeview(doboz, columns=oszlopok, show="headings",
+                               selectmode="browse", height=5)
+        fejlecek = (("nev", "Minőség", 190, "w"), ("felbontas", "Felbontás", 110, "center"),
+                    ("fps", "FPS", 60, "center"), ("kodek", "Kodek", 90, "center"),
+                    ("meret", "Méret", 90, "e"))
+        for azon, cim, szel, igazit in fejlecek:
+            self.fa.heading(azon, text=cim, anchor="w" if igazit == "w" else "center")
+            self.fa.column(azon, width=szel, anchor=igazit,
+                           stretch=(azon == "nev"))
+        self.fa.grid(row=0, column=0, sticky="nsew")
+        self.fa.tag_configure("ajanlott", foreground=SZIN["siker"])
+        self.fa.bind("<Double-1>", lambda e: self._letoltes_inditasa())
+
+        gorgeto = ttk.Scrollbar(doboz, orient="vertical", command=self.fa.yview)
+        gorgeto.grid(row=0, column=1, sticky="ns")
+        self.fa.configure(yscrollcommand=gorgeto.set)
+
+        self.minoseg_ures = tk.Label(
+            doboz, bg=SZIN["mezo"], fg=SZIN["halvany2"], font=(BETU, 10),
+            justify="center",
+            text="Illeszd be a videó linkjét,\n"
+                 "és itt megjelenik minden elérhető minőség.")
+        self.minoseg_ures.place(relx=0.5, rely=0.5, anchor="center")
+
+    def _minoseg_lathatosag(self):
+        video = self.mod == "video"
+        if video:
+            self.minoseg_keret.grid()
         else:
-            self.hossz_cimke.config(text="pl. 3:00:00 → 3:20:00", fg="#6c7086")
+            self.minoseg_keret.grid_remove()
+        # Ha a lista rejtve van, ne maradjon utána tátongó üres sáv: a
+        # nyúló súlyt is el kell venni a sorától.
+        # A minsize garantálja, hogy a lista sose lapuljon a fejlécsorra akkor
+        # sem, ha az ablak szűk - inkább a nyúló részek adják a helyet.
+        self.torzs.grid_rowconfigure(3, weight=1 if video else 0,
+                                     minsize=186 if video else 0)
 
-    def _hossz_frissites(self):
-        """Lekérdezés után: hossz kiírása, és a végpont mező kitöltése ha üres."""
-        self._hossz_kiiras()
-        if self.szakasz_var.get() and self.video_hossz and not self.szakasz_veg.get().strip():
-            self.szakasz_veg.insert(0, ido_formazas(self.video_hossz))
-
-    def _mod_valtozott(self):
-        if self.mod_var.get() == "video" and self.formatumok:
-            self.fmt_keret.pack(fill="both", expand=True, padx=20, pady=(4, 0),
-                                before=self.gomb)
+    def _minoseg_osszefoglalo(self):
+        if self.mod == "zene":
+            self._allapot_sugo("MP3 · legjobb elérhető hangminőség (~245 kbps VBR)")
+        elif self.mod == "vr":
+            self._allapot_sugo("VR: a legjobb minőség, _3D_SBS névvel jelölve")
         else:
-            self.fmt_keret.pack_forget()
+            self._allapot_sugo("")
+
+    def _allapot_sugo(self, szoveg):
+        self.sugo_cimke.config(text=szoveg)
+
+    # -- akciósáv ------------------------------------------------------------
+
+    def _akciosav_epites(self):
+        keret = tk.Frame(self, bg=SZIN["panel"], padx=20, pady=12)
+        keret.grid(row=2, column=0, sticky="ew")
+        keret.grid_columnconfigure(1, weight=1)
+        tk.Frame(self, bg=SZIN["keret"], height=1).grid(row=2, column=0, sticky="new")
+
+        self.letoltes_gomb = Gomb(keret, "↓   Letöltés", self._letoltes_inditasa,
+                                  "elsodleges", meret=12, vastag=True,
+                                  padx=26, pady=11)
+        self.letoltes_gomb.grid(row=0, column=0, rowspan=2, sticky="w")
+
+        jobb = tk.Frame(keret, bg=SZIN["panel"])
+        jobb.grid(row=0, column=1, rowspan=2, sticky="ew", padx=(18, 0))
+        jobb.grid_columnconfigure(0, weight=1)
+
+        felso = tk.Frame(jobb, bg=SZIN["panel"])
+        felso.grid(row=0, column=0, sticky="ew")
+        self.haladas_cimke = self._cimke(felso, "Készen áll.", 10, SZIN["halvany"])
+        self.haladas_cimke.pack(side="left")
+        self.sugo_cimke = self._cimke(felso, "", 9, SZIN["halvany2"])
+        self.sugo_cimke.pack(side="right")
+
+        self.haladas = ttk.Progressbar(jobb, style="Fo.Horizontal.TProgressbar",
+                                       mode="determinate", maximum=100)
+        self.haladas.grid(row=1, column=0, sticky="ew", pady=(7, 0))
+
+        self.mappa_gomb = Gomb(keret, "📂  Mappa", self._mappa_megnyitas,
+                               "masodlagos", meret=10)
+        self.mappa_gomb.grid(row=0, column=2, rowspan=2, sticky="e", padx=(14, 0))
+
+    # -- napló ---------------------------------------------------------------
+
+    def _naplo_epites(self):
+        # A tk.Frame padx/pady-ja egyetlen távolság (a pack/grid-é lehet tuple),
+        # ezért az alsó margót a grid adja.
+        self.naplo_keret = tk.Frame(self, bg=SZIN["hatter"], padx=20, pady=10)
+        self.naplo_keret.grid(row=3, column=0, sticky="nsew", pady=(0, 4))
+        self.naplo_keret.grid_columnconfigure(0, weight=1)
+        self.naplo_keret.grid_rowconfigure(1, weight=1)
+
+        fej = tk.Frame(self.naplo_keret, bg=SZIN["hatter"])
+        fej.grid(row=0, column=0, sticky="ew", pady=(0, 5))
+        self._cimke(fej, "NAPLÓ", 8, SZIN["halvany2"], True).pack(side="left")
+        Gomb(fej, "Naplófájl", self._naplo_megnyitas, "csendes", meret=8,
+             padx=8, pady=3).pack(side="right")
+        Gomb(fej, "Törlés", self._naplo_torles, "csendes", meret=8,
+             padx=8, pady=3).pack(side="right", padx=(0, 6))
+
+        doboz = tk.Frame(self.naplo_keret, bg=SZIN["keret"], padx=1, pady=1)
+        doboz.grid(row=1, column=0, sticky="nsew")
+        doboz.grid_columnconfigure(0, weight=1)
+        doboz.grid_rowconfigure(0, weight=1)
+
+        self.naplo = tk.Text(doboz, font=("Consolas", 9), bg=SZIN["mezo"],
+                             fg=SZIN["halvany"], relief="flat", bd=0,
+                             padx=10, pady=8, state="disabled", wrap="word",
+                             height=6, insertbackground=SZIN["kiemel"],
+                             selectbackground=SZIN["keret2"])
+        self.naplo.grid(row=0, column=0, sticky="nsew")
+        gorgeto = ttk.Scrollbar(doboz, orient="vertical", command=self.naplo.yview)
+        gorgeto.grid(row=0, column=1, sticky="ns")
+        self.naplo.configure(yscrollcommand=gorgeto.set)
+
+        for tag, szin in (("siker", SZIN["siker"]), ("hiba", SZIN["hiba"]),
+                          ("figyelem", SZIN["figyelem"]), ("info", SZIN["kiemel"]),
+                          ("halvany", SZIN["halvany2"])):
+            self.naplo.tag_configure(tag, foreground=szin)
+
+    def _beallitasok_alkalmazasa(self):
+        b = self.beallitas
+        if b.get("mappa"):
+            self.mappa_valtozo.set(b["mappa"])
+        self.mod = b.get("mod") if b.get("mod") in ("zene", "video", "vr") else "video"
+        self._felulet_allapot(False)
+        self.url_mezo.entry.focus_set()
+
+    def _beallitasok_mentese(self):
+        beallitasok_mentes({"mappa": self.mappa_valtozo.get(), "mod": self.mod})
+
+    # ------------------------------------------------------- alap segédek --
+
+    def _fo_szalon(self, fv, *argumentumok):
+        """Tkinter nem szálbiztos: minden widget-művelet a fő szálon fut.
+
+        Az ellenőrzés és a hívás között is leállhat az értelmező, ezért a
+        RuntimeError-t is el kell kapni."""
+        if self._destroyed:
+            return
+        try:
+            self.after(0, lambda: None if self._destroyed else fv(*argumentumok))
+        except RuntimeError:
+            pass
 
     def _log(self, szoveg, csak_fajlba=False):
         """A napló mindig fájlba is megy - a hibakereséshez ez a forrás."""
@@ -717,33 +1648,72 @@ class ZeneLetolto(tk.Tk):
         if csak_fajlba:
             return
 
-        def _frissit():
-            if self._destroyed:
-                return
+        def frissit():
+            tag = ""
+            if szoveg.startswith(("✅", "🎉")):
+                tag = "siker"
+            elif szoveg.startswith(("❌", "⛔")):
+                tag = "hiba"
+            elif szoveg.startswith("⚠️"):
+                tag = "figyelem"
+            elif szoveg.startswith(("📹", "🎬", "🎵", "🥽", "✂️", "📂")):
+                tag = "info"
+            elif szoveg.startswith("   ") or szoveg.startswith("["):
+                tag = "halvany"
             self.naplo.config(state="normal")
-            self.naplo.insert("end", szoveg + "\n")
-            # Max 500 sor megtartása
-            sorok = int(self.naplo.index('end-1c').split('.')[0])
+            self.naplo.insert("end", szoveg + "\n", tag)
+            sorok = int(self.naplo.index("end-1c").split(".")[0])
             if sorok > 500:
-                self.naplo.delete('1.0', f'{sorok - 500}.0')
+                self.naplo.delete("1.0", f"{sorok - 500}.0")
             self.naplo.see("end")
             self.naplo.config(state="disabled")
-        if self._destroyed:
-            return
-        try:
-            self.after(0, _frissit)
-        except RuntimeError:
-            pass
+        self._fo_szalon(frissit)
 
-    def _init_eszközök(self):
+    def _naplo_torles(self):
+        self.naplo.config(state="normal")
+        self.naplo.delete("1.0", "end")
+        self.naplo.config(state="disabled")
+
+    def _haladas_beallit(self, szazalek=None, szoveg=None, stilus=None):
+        """Haladásjelző frissítése (a hívó lehet háttérszál)."""
+        def frissit():
+            if stilus:
+                self.haladas.config(style=stilus)
+            if szazalek is None:
+                if str(self.haladas["mode"]) != "indeterminate":
+                    self.haladas.config(mode="indeterminate")
+                    self.haladas.start(14)
+            else:
+                if str(self.haladas["mode"]) == "indeterminate":
+                    self.haladas.stop()
+                    self.haladas.config(mode="determinate")
+                self.haladas["value"] = max(0, min(100, szazalek))
+            if szoveg is not None:
+                self.haladas_cimke.config(text=szoveg)
+        self._fo_szalon(frissit)
+
+    def _haladas_fojtott(self, szazalek, szoveg):
+        """Másodpercenként legfeljebb ~8 frissítés, hogy ne fulladjon a felület."""
+        most = time.monotonic()
+        if most - self._haladas_utolso < 0.12:
+            return
+        self._haladas_utolso = most
+        self._haladas_beallit(szazalek, szoveg)
+
+    # ------------------------------------------------------------ eszközök --
+
+    def _init_eszkozok(self):
         try:
-            self._log("Eszközök ellenőrzése...")
+            self._allapot("eszközök ellenőrzése…", "figyelem")
+            self._log("Eszközök ellenőrzése…")
             eszközök_letöltése(self._log)
             ytdlp_frissites(self._log)
-            self._log("Kész! Írd be az URL-t és nyomj Lekérdezést.")
             self._verziok_naplozasa()
+            self._log("✅ Kész. Illeszd be a videó linkjét.")
+            self._allapot("készen áll", "siker")
         except Exception as e:
-            self._log(f"HIBA az eszközök letöltésekor: {e}")
+            self._log(f"❌ Hiba az eszközök letöltésekor: {e}")
+            self._allapot("eszközhiba", "hiba")
             fajlba_naplo(traceback.format_exc())
 
     def _verziok_naplozasa(self):
@@ -759,6 +1729,63 @@ class ZeneLetolto(tk.Tk):
             except Exception as e:
                 fajlba_naplo(f"{cimke} verzió lekérése sikertelen: {e}")
 
+    def _eszkozok_keszen(self):
+        """A letöltéshez a yt-dlp és az ffmpeg is kell (merge, mp3, szakasz)."""
+        if not os.path.isfile(YTDLP_EXE):
+            self._log("⚠️ A yt-dlp még letöltődik, várj pár másodpercet!")
+            return False
+        if not os.path.isfile(FFMPEG_EXE):
+            self._log("⚠️ Az ffmpeg még letöltődik, várj pár másodpercet!")
+            return False
+        return True
+
+    # -------------------------------------------------------- felhasználói --
+
+    def _vagolap_beillesztes(self):
+        try:
+            szoveg = self.clipboard_get()
+        except tk.TclError:
+            self._log("⚠️ A vágólap üres.")
+            return
+        self.url_mezo.set(url_rendbetetel(szoveg))
+        self._elemzes_inditasa()
+
+    def _url_valtozott(self, _=None):
+        """Gépelés/beillesztés után rövid szünettel magától elemez.
+
+        Így nem lehet elfelejteni az Elemzés gombot - ez volt a felület
+        legnagyobb csapdája."""
+        szoveg = self.url_mezo.get().strip()
+        if szoveg == self._elozo_url_szoveg:
+            return
+        self._elozo_url_szoveg = szoveg
+        if self._elemzes_idozito:
+            try:
+                self.after_cancel(self._elemzes_idozito)
+            except (ValueError, tk.TclError):
+                pass
+            self._elemzes_idozito = None
+        url = url_rendbetetel(szoveg)
+        if not url.startswith("http") or len(url) < 15:
+            return
+        if url == self.lekerdezett_url or self.fut:
+            return
+        self._elemzes_idozito = self.after(900, self._elemzes_inditasa)
+
+    def _mappa_valasztas(self):
+        mappa = filedialog.askdirectory(initialdir=self.mappa_valtozo.get())
+        if mappa:
+            self.mappa_valtozo.set(os.path.normpath(mappa))
+            self._beallitasok_mentese()
+
+    def _mappa_megnyitas(self):
+        mappa = self.utolso_mappa or self.mappa_valtozo.get()
+        try:
+            os.makedirs(mappa, exist_ok=True)
+            os.startfile(mappa)
+        except OSError as e:
+            messagebox.showerror("Mappa", f"Nem sikerült megnyitni:\n{mappa}\n\n{e}")
+
     def _naplo_megnyitas(self):
         if not os.path.isfile(NAPLO_FAJL):
             messagebox.showinfo("Napló", f"A naplófájl még nem jött létre.\n\n{NAPLO_FAJL}")
@@ -768,362 +1795,487 @@ class ZeneLetolto(tk.Tk):
         except OSError as e:
             messagebox.showerror("Napló", f"Nem sikerült megnyitni:\n{NAPLO_FAJL}\n\n{e}")
 
-    def _mappa_valasztas(self):
-        mappa = filedialog.askdirectory(initialdir=self.mappa_var.get())
-        if mappa:
-            self.mappa_var.set(mappa)
+    def _szakasz_valtozott(self):
+        be = self.szakasz_valtozo.get() and self.elemezve
+        self.szakasz_kezd.allapot("normal" if be else "disabled")
+        self.szakasz_veg.allapot("normal" if be else "disabled")
 
-    def _eszkozok_keszen(self):
-        """A letöltéshez a yt-dlp és az ffmpeg is kell (merge, mp3, szakasz)."""
-        if not os.path.isfile(YTDLP_EXE):
-            self._log("⚠️ A yt-dlp még letöltődik, várj!")
-            return False
-        if not os.path.isfile(FFMPEG_EXE):
-            self._log("⚠️ Az ffmpeg még letöltődik, várj!")
-            return False
-        return True
+        hossz = self.video_hossz or 0 if self.elemezve else 0
+        kezd = ido_ertelmezes(self.szakasz_kezd.get())
+        veg = ido_ertelmezes(self.szakasz_veg.get())
+        if kezd is None or veg is None or not hossz or veg > hossz or kezd >= veg:
+            # Alapból a videó egy negyedét ajánljuk fel - így rögtön látszik,
+            # mit csinál a csúszka.
+            kezd, veg = int(hossz * 0.25), int(hossz * 0.5)
+        # A sáv a bekapcsolt jelölőnégyzet nélkül is mutatja a videó
+        # idővonalát (szürkén), csak nem lehet húzni.
+        self.szakasz_sav.beallit(hossz, kezd, veg, ertesit=be)
+        self.szakasz_sav.engedelyez(be)
 
-    def _url_ellenorzes(self, url):
+    def _felulet_allapot(self, elemezve):
+        """Elemzés előtt minden vezérlő szürke: nincs mit beállítani rajtuk."""
+        self.elemezve = elemezve
+        allapot = "normal" if elemezve else "disabled"
+        for gomb in self.mod_gombok.values():
+            gomb.config(state=allapot)
+        self._mod_valtas(self.mod)              # színek újrafestése
+        self.fa.state(("!disabled",) if elemezve else ("disabled",))
+        self.szakasz_kapcsolo.config(
+            state=allapot, fg=SZIN["szoveg"] if elemezve else SZIN["halvany2"])
+        self.playlist_kapcsolo.config(
+            state=allapot, fg=SZIN["halvany"] if elemezve else SZIN["halvany2"])
+        self.letoltes_gomb.config(state=allapot)
+        self._szakasz_valtozott()
+
+    def _kilep(self):
+        self._destroyed = True
+        self._beallitasok_mentese()
+        self._folyamat_leallitas()
+        self.destroy()
+
+    # --------------------------------------------------------- elemzés -----
+
+    def _elemzes_inditasa(self):
+        if self._elemzes_idozito:
+            try:
+                self.after_cancel(self._elemzes_idozito)
+            except (ValueError, tk.TclError):
+                pass
+            self._elemzes_idozito = None
+
+        url = url_rendbetetel(self.url_mezo.get())
         if not url:
-            messagebox.showwarning("Figyelem", "Adj meg egy URL-t!")
-            return False
-        if not url.startswith("http://") and not url.startswith("https://"):
-            messagebox.showwarning("Figyelem", "Adj meg egy érvényes URL-t!\nPélda: https://www.youtube.com/watch?v=XXXXX")
-            return False
-        return True
-
-    def _formatumok_lekerese(self):
-        url = self.url_mezo.get().strip()
-        if not self._url_ellenorzes(url):
+            messagebox.showwarning("Hiányzó link", "Illeszd be a videó linkjét!")
+            return
+        self.url_mezo.set(url)
+        self._elozo_url_szoveg = url
+        if not url.startswith(("http://", "https://")):
+            messagebox.showwarning("Hibás link",
+                                   "Ez nem érvényes link.\n"
+                                   "Példa: https://www.youtube.com/watch?v=XXXXXXXX")
             return
         if not os.path.isfile(YTDLP_EXE):
             self._log("⚠️ Az eszközök még letöltődnek, várj!")
             return
         if self.fut:
-            self._log("⚠️ Már folyamatban van egy művelet, várj!")
+            self._log("⚠️ Már fut egy művelet, várj!")
             return
+
         self.fut = True
-        self.lekerdezes_gomb.config(state="disabled", text="⏳ Lekérdezés...")
-        # Régi formátumok törlése azonnal
+        self.elemzes_gomb.config(state="disabled", text="Elemzés…")
+        self._allapot("elemzés…", "kiemel")
+        self._haladas_beallit(None, "Videó adatainak lekérdezése…")
+        self._formatumok_torlese()
+        threading.Thread(target=self._elemzes_worker, args=(url,), daemon=True).start()
+
+    def _formatumok_torlese(self):
         self.formatumok = []
+        self.info = None
         self.video_hossz = None
         self.lekerdezett_url = None
-        self._hossz_kiiras()
-        self.fmt_keret.pack_forget()
-        for w in self.fmt_belso.winfo_children():
-            w.destroy()
-        threading.Thread(target=self._formatumok_worker, args=(url, self.mod_var.get()), daemon=True).start()
+        for elem in self.fa.get_children():
+            self.fa.delete(elem)
+        self.minoseg_info.config(text="")
+        self._felulet_allapot(False)
 
-    def _formatumok_worker(self, url, mod):
+    def _elemzes_worker(self, url):
         try:
-            self._log(f"\nFormátumok lekérdezése: {url}")
+            self._log(f"\n🔍 Elemzés: {url}")
             info, hiba = formatumok_lekerese(url)
-            if hiba or info is None:
-                self._log(f"❌ Hiba: {hiba}")
+            if hiba or not info:
+                self._log(f"❌ {hiba}")
+                self._allapot("sikertelen elemzés", "hiba")
+                self._haladas_beallit(0, "Az elemzés nem sikerült.")
                 return
 
-            cim = info.get("title", "?")
+            self.info = info
             hossz = info.get("duration")
-            hossz_str = ""
-            if hossz:
-                self.video_hossz = int(hossz)
-                hossz_str = f"  |  {ido_formazas(hossz)}"
-            self._log(f"📹 {cim}{hossz_str}")
+            self.video_hossz = int(hossz) if hossz else None
             self.lekerdezett_url = url
-            try:
-                if not self._destroyed:
-                    self.after(0, self._hossz_frissites)
-            except RuntimeError:
-                pass
-
-            if mod == "zene":
-                # Régi formátumok törlése
-                self.formatumok = []
-                try:
-                    if not self._destroyed:
-                        self.after(0, lambda: self.fmt_keret.pack_forget())
-                except RuntimeError:
-                    pass
-                # Audió infó kiírása
-                formats = info.get("formats", [])
-                audio_fmts = [f for f in formats if f.get("acodec", "none") != "none" and f.get("vcodec", "none") == "none"]
-                if not audio_fmts:
-                    # Kombinált formátumokból keressük az audiót
-                    audio_fmts = [f for f in formats if f.get("acodec", "none") != "none"]
-                if audio_fmts:
-                    best = max(audio_fmts, key=lambda f: f.get("abr") or f.get("tbr") or 0)
-                    ac = best.get("acodec", "?")
-                    if ac and "." in ac:
-                        ac = ac.split(".")[0]
-                    abr = best.get("abr") or best.get("tbr") or 0
-                    sr = best.get("asr", "?")
-                    self._log(f"🎵 Forrás audió: {ac} | {abr:.0f} kbps | {sr} Hz")
-                    self._log(f"🎵 MP3 kimenet: legjobb minőség (~245 kbps VBR)")
-                self._log("✅ Kész a letöltésre! Nyomj Letöltést.")
-                return
-
-            if mod == "vr":
-                # VR: legjobb minőség infó kiírása
-                self.formatumok = []
-                try:
-                    if not self._destroyed:
-                        self.after(0, lambda: self.fmt_keret.pack_forget())
-                except RuntimeError:
-                    pass
-                formats = info.get("formats", [])
-                video_fmts = [f for f in formats if (f.get("vcodec", "none") != "none" or f.get("height")) and f.get("height")]
-                if video_fmts:
-                    best_v = max(video_fmts, key=lambda f: (f.get("height", 0), f.get("tbr", 0) or 0))
-                    h = best_v.get("height", "?")
-                    w = best_v.get("width")
-                    vcodec = best_v.get("vcodec")
-                    if vcodec and vcodec != "none" and "." in vcodec:
-                        vcodec = vcodec.split(".")[0]
-                    elif not vcodec or vcodec == "none":
-                        vcodec = None
-                    fps = best_v.get("fps")
-                    tbr = best_v.get("tbr") or best_v.get("vbr") or 0
-                    filesize = best_v.get("filesize") or best_v.get("filesize_approx")
-                    reszek = []
-                    if w:
-                        reszek.append(f"{w}x{h}")
-                    else:
-                        reszek.append(f"{h}p")
-                    if vcodec:
-                        reszek.append(vcodec)
-                    if fps:
-                        reszek.append(f"{int(fps) if isinstance(fps, float) and fps == int(fps) else fps}fps")
-                    if tbr:
-                        reszek.append(f"{tbr:.0f} kbps")
-                    if filesize:
-                        mb = filesize / (1024 * 1024)
-                        reszek.append(f"~{mb/1024:.1f} GB" if mb >= 1024 else f"~{mb:.0f} MB")
-                    self._log(f"🥽 Legjobb videó: {' | '.join(reszek)}")
-                audio_fmts = [f for f in formats if f.get("acodec", "none") != "none" and f.get("vcodec", "none") == "none"]
-                if not audio_fmts:
-                    audio_fmts = [f for f in formats if f.get("acodec", "none") != "none"]
-                if audio_fmts:
-                    best_a = max(audio_fmts, key=lambda f: f.get("abr") or f.get("tbr") or 0)
-                    ac = best_a.get("acodec", "?")
-                    if ac and "." in ac:
-                        ac = ac.split(".")[0]
-                    abr = best_a.get("abr") or best_a.get("tbr") or 0
-                    self._log(f"🥽 Legjobb audió: {ac} | {abr:.0f} kbps")
-                self._log("✅ Kész a letöltésre! Nyomj Letöltést.")
-                return
-
             self.formatumok = formatum_csoportositas(info)
 
-            if not self.formatumok:
-                self._log("❌ Nem találtam elérhető videó formátumokat.")
-                return
+            cim = info.get("title") or "?"
+            self._log(f"📹 {cim}"
+                      + (f"  |  {ido_formazas(hossz)}" if hossz else ""))
 
-            # Legjobb minőség kiírása
-            legjobb = self.formatumok[-1]
-            self._log(f"🎬 Legjobb: {legjobb['leiras']}")
-            self._log(f"✅ {len(self.formatumok)} felbontás elérhető.")
+            if self.formatumok:
+                legjobb = self.formatumok[-1]
+                self._log(f"🎬 Legjobb: {legjobb['leiras']}")
+                self._log(f"🎵 Hang: {legjobb['hang_leiras']}")
+                self._log(f"✅ {len(self.formatumok)} minőség elérhető.")
+            else:
+                self._log("⚠️ Nem találtam letölthető videósávot "
+                          "(lehet, hogy ez csak hang).")
 
-            # UI frissítés a fő szálban
-            try:
-                if not self._destroyed:
-                    self.after(0, self._formatumok_megjelenites)
-            except RuntimeError:
-                pass
+            self._fo_szalon(self._elemzes_megjelenites)
+            self._allapot("kész az elemzés", "siker")
+            threading.Thread(target=self._boritokep_elonezet,
+                             args=(info,), daemon=True).start()
         except Exception as e:
-            self._log(f"❌ Hiba: {e}")
+            self._log(f"❌ Váratlan hiba az elemzés közben: {e}")
+            fajlba_naplo(traceback.format_exc())
+            self._allapot("hiba", "hiba")
         finally:
             self.fut = False
-            try:
-                if not self._destroyed:
-                    self.after(0, lambda: self.lekerdezes_gomb.config(state="normal", text="🔍 Lekérdezés"))
-            except RuntimeError:
-                pass
+            self._fo_szalon(lambda: self.elemzes_gomb.config(
+                state="normal", text="Elemzés"))
 
-    def _formatumok_megjelenites(self):
-        # Töröljük a régi opciókat
-        for w in self.fmt_belso.winfo_children():
+    def _elemzes_megjelenites(self):
+        info = self.info or {}
+        self.cim_cimke.config(text=info.get("title") or "–")
+
+        reszek = []
+        if info.get("uploader"):
+            reszek.append(info["uploader"])
+        if self.video_hossz:
+            reszek.append(ido_formazas(self.video_hossz))
+        if info.get("view_count"):
+            reszek.append(f"{info['view_count']:,}".replace(",", " ") + " megtekintés")
+        self.alcim_cimke.config(text="  ·  ".join(reszek))
+
+        for w in self.jelveny_sor.winfo_children():
             w.destroy()
-
-        # Utolsót (legmagasabb felbontás) jelöljük ki alapból
         if self.formatumok:
-            self.fmt_valasztas.set(str(self.formatumok[-1]["height"]))
+            legjobb = self.formatumok[-1]
+            self._jelveny(legjobb["nev"].split(" · ")[0].upper(), SZIN["siker"])
+            self._jelveny(legjobb["felbontas"], SZIN["halvany"])
+            self._jelveny(legjobb["kodek"], SZIN["halvany"])
+            if legjobb["hdr"]:
+                self._jelveny("HDR", SZIN["lila"])
 
-        self.fmt_canvas.yview_moveto(0)  # Scroll reset
-        for fmt in reversed(self.formatumok):  # Legnagyobb felül
-            rb = tk.Radiobutton(
-                self.fmt_belso, text=fmt["leiras"],
-                variable=self.fmt_valasztas, value=str(fmt["height"]),
-                font=("Consolas", 10), bg="#181825", fg="#cdd6f4",
-                selectcolor="#313244", activebackground="#181825",
-                activeforeground="#cdd6f4", cursor="hand2", anchor="w",
-                wraplength=680, justify="left"
-            )
-            rb.pack(fill="x", anchor="w", padx=4, pady=1)
-            rb.bind("<MouseWheel>", lambda e: self.fmt_canvas.yview_scroll(int(-1 * (e.delta / 120)), "units"))
+        self.info_kartya.grid(row=self._info_sor, column=0, sticky="ew", pady=(10, 0))
 
-        if self.mod_var.get() == "video":
-            self.fmt_keret.pack(fill="both", expand=True, padx=20, pady=(4, 0),
-                                before=self.gomb)
+        # minőséglista feltöltése - a legjobb legfelül, kijelölve
+        for elem in self.fa.get_children():
+            self.fa.delete(elem)
+        for i, fmt in enumerate(reversed(self.formatumok)):
+            azon = self.fa.insert(
+                "", "end", iid=str(len(self.formatumok) - 1 - i),
+                values=(fmt["nev"], fmt["felbontas"], fmt["fps"],
+                        fmt["kodek"], fmt["meret_szoveg"]),
+                tags=("ajanlott",) if i == 0 else ())
+            if i == 0:
+                self.fa.selection_set(azon)
+                self.fa.focus(azon)
+        if self.formatumok:
+            self.minoseg_ures.place_forget()
+            self.minoseg_info.config(
+                text=f"{len(self.formatumok)} minőség · hang: "
+                     f"{self.formatumok[-1]['hang_leiras']}")
+        else:
+            self.minoseg_ures.config(text="Ehhez a linkhez nem találtam\n"
+                                          "letölthető videóformátumot.")
+            self.minoseg_ures.place(relx=0.5, rely=0.5, anchor="center")
 
-    def _megallitas(self):
-        if not self.letolt_fut:
-            return
-        # A jelzőt akkor is be kell állítani, ha épp nincs futó folyamat: a saját
-        # szakasz-letöltő Range kérések között ezt figyeli.
-        self._megszakitva = True
-        self._log("⛔ Letöltés megszakítva.")
+        self._felulet_allapot(True)
+        self._haladas_beallit(0, "Készen áll a letöltésre.")
+
+    def _boritokep_elonezet(self, info):
+        """Kis előnézeti kép az info-kártyára (ffmpeg-gel png-vé alakítva,
+        mert a Tk csak png/gif-et tud). Ha nem sikerül, marad az ikon."""
         try:
-            proc = self.process
-            if proc and proc.poll() is None:
-                proc.terminate()
-        except OSError:
-            pass
+            if not os.path.isfile(FFMPEG_EXE):
+                return
+            url = None
+            for t in reversed(info.get("thumbnails") or []):
+                if t.get("url") and (t.get("width") or 0) >= 320:
+                    url = t["url"]
+            url = url or info.get("thumbnail")
+            if not url:
+                return
+            nyers = os.path.join(APP_MAPPA, "elonezet.nyers")
+            png = os.path.join(APP_MAPPA, "elonezet.png")
+            with open(nyers, "wb") as f:
+                f.write(http_tartomany(url, timeout=20, probalkozas=2))
+            r = subprocess.run(
+                [FFMPEG_EXE, "-y", "-hide_banner", "-loglevel", "error",
+                 "-i", nyers, "-vf", "scale=140:79:force_original_aspect_ratio=increase,"
+                 "crop=140:79", "-frames:v", "1", "-update", "1", png],
+                capture_output=True, timeout=30,
+                creationflags=subprocess.CREATE_NO_WINDOW)
+            try:
+                os.remove(nyers)
+            except OSError:
+                pass
+            if r.returncode != 0 or not os.path.isfile(png):
+                return
+
+            def beallit():
+                try:
+                    self._boritokep = tk.PhotoImage(file=png)
+                    self.kep_cimke.config(image=self._boritokep, text="",
+                                          width=140, height=79)
+                except tk.TclError as e:
+                    fajlba_naplo(f"előnézeti kép betöltése sikertelen: {e}")
+            self._fo_szalon(beallit)
+        except Exception as e:
+            fajlba_naplo(f"előnézeti kép hiba: {e}")
+
+    # -------------------------------------------------------- letöltés -----
+
+    def _valasztott_formatum(self):
+        kijelolt = self.fa.selection()
+        if not kijelolt:
+            return self.formatumok[-1] if self.formatumok else None
+        try:
+            return self.formatumok[int(kijelolt[0])]
+        except (ValueError, IndexError):
+            return self.formatumok[-1] if self.formatumok else None
 
     def _szakasz_ellenorzes(self):
-        """None = nincs szakasz, False = hibás megadás, egyébként (kezd_mp, veg_mp)."""
-        if not self.szakasz_var.get():
+        """None = nincs szakasz, False = hibás megadás, egyébként (kezd, veg).
+
+        A hívó `is False`-szal tesztel: a (0, 120) tuple igaz, de a 0 kezdet
+        miatt könnyű elrontani."""
+        if not self.szakasz_valtozo.get():
             return None
         kezd_szoveg = self.szakasz_kezd.get().strip()
         veg_szoveg = self.szakasz_veg.get().strip()
         if not kezd_szoveg and not veg_szoveg:
-            messagebox.showwarning("Figyelem", "Add meg a szakasz kezdetét és/vagy végét!\nPélda: 3:00:00 és 3:20:00")
+            messagebox.showwarning("Részlet", "Add meg a szakasz kezdetét és végét!\n"
+                                              "Például: 3:00:00  →  3:20:00")
             return False
 
         kezd = 0 if not kezd_szoveg else ido_ertelmezes(kezd_szoveg)
         if kezd is None:
-            messagebox.showwarning("Figyelem", f"Érvénytelen kezdő időpont: {kezd_szoveg}\nHasználható formátumok: 3:20:15, 20:15, 15")
+            messagebox.showwarning("Részlet", f"Érvénytelen kezdő időpont: {kezd_szoveg}\n"
+                                              "Használható: 3:20:15 · 20:15 · 15")
             return False
-
         if not veg_szoveg:
             veg = self.video_hossz
             if not veg:
-                messagebox.showwarning("Figyelem", "Add meg a szakasz végét is, vagy nyomj előbb Lekérdezést!")
+                messagebox.showwarning("Részlet", "Add meg a szakasz végét is!")
                 return False
         else:
             veg = ido_ertelmezes(veg_szoveg)
             if veg is None:
-                messagebox.showwarning("Figyelem", f"Érvénytelen befejező időpont: {veg_szoveg}\nHasználható formátumok: 3:20:15, 20:15, 15")
+                messagebox.showwarning("Részlet", f"Érvénytelen befejező időpont: {veg_szoveg}\n"
+                                                  "Használható: 3:20:15 · 20:15 · 15")
                 return False
-
         if veg <= kezd:
-            messagebox.showwarning("Figyelem", f"A vég ({ido_formazas(veg)}) nem lehet korábban a kezdetnél ({ido_formazas(kezd)})!")
+            messagebox.showwarning("Részlet", f"A vég ({ido_formazas(veg)}) nem lehet "
+                                              f"korábban a kezdetnél ({ido_formazas(kezd)})!")
             return False
         if self.video_hossz and kezd >= self.video_hossz:
-            messagebox.showwarning("Figyelem", f"A kezdő időpont ({ido_formazas(kezd)}) túl van a videó végén ({ido_formazas(self.video_hossz)})!")
+            messagebox.showwarning("Részlet", f"A kezdet ({ido_formazas(kezd)}) túl van "
+                                              f"a videó végén ({ido_formazas(self.video_hossz)})!")
             return False
         if self.video_hossz and veg > self.video_hossz:
-            self._log(f"⚠️ A megadott vég ({ido_formazas(veg)}) túllóg a videó hosszán, levágom {ido_formazas(self.video_hossz)}-ra.")
+            self._log(f"⚠️ A megadott vég túllóg a videó hosszán, "
+                      f"levágom {ido_formazas(self.video_hossz)}-ra.")
             veg = self.video_hossz
         return (kezd, veg)
 
     def _letoltes_inditasa(self):
-        url = self.url_mezo.get().strip()
-        if not self._url_ellenorzes(url):
-            return
         if self.letolt_fut:
-            if messagebox.askyesno("Megszakítás", "Már fut egy letöltés. Megszakítod?"):
-                self._megallitas()
+            self._megallitas()
             return
         if self.fut:
-            self._log("⚠️ Már folyamatban van egy lekérdezés, várj!")
+            self._log("⚠️ Még fut az elemzés, egy pillanat…")
             return
 
+        url = url_rendbetetel(self.url_mezo.get())
+        if not url.startswith(("http://", "https://")):
+            messagebox.showwarning("Hiányzó link", "Illeszd be a videó linkjét!")
+            return
+        self.url_mezo.set(url)
         if not self._eszkozok_keszen():
             return
-        mod = self.mod_var.get()
-        if mod == "video" and not self.formatumok:
-            messagebox.showwarning("Figyelem", "Először nyomj Lekérdezést a felbontások letöltéséhez!")
-            return
-        # A format_id-k videónként egyediek: ha az URL a lekérdezés óta
-        # megváltozott, a régi azonosítók rossz minőséget eredményeznének.
-        if self.lekerdezett_url and url != self.lekerdezett_url:
-            if mod == "video":
-                messagebox.showwarning("Figyelem", "Az URL megváltozott a lekérdezés óta.\nNyomj újra Lekérdezést!")
-                return
-            self.video_hossz = None
-            self.lekerdezett_url = None
-            self._hossz_kiiras()
-        if mod == "vr":
-            self.formatumok = []
-            self.fmt_keret.pack_forget()
 
-        # Playlist figyelmeztetés
-        if self.playlist_var.get() and "list=" not in url:
-            if not messagebox.askyesno("Figyelem", "A 'Playlist letöltése' be van pipálva, de ez nem playlist link.\nBiztosan folytatod egyedi videóként?"):
-                return
-            self.playlist_var.set(False)
-        elif not self.playlist_var.get() and "list=" in url:
-            valasz = messagebox.askyesno("Figyelem", "Ez egy playlist link, de a 'Playlist letöltése' nincs bepipálva.\nLetöltsem az egész playlistet?")
-            if valasz:
-                self.playlist_var.set(True)
+        mappa = self.mappa_valtozo.get().strip()
+        if not mappa:
+            messagebox.showwarning("Mentés helye", "Válaszd ki, hova mentsem a fájlt!")
+            return
+        try:
+            os.makedirs(mappa, exist_ok=True)
+        except OSError as e:
+            messagebox.showerror("Mentés helye", f"Nem tudok írni ebbe a mappába:\n{mappa}\n\n{e}")
+            return
 
         szakasz = self._szakasz_ellenorzes()
         if szakasz is False:
             return
-        if szakasz and self.playlist_var.get():
-            if not messagebox.askyesno("Figyelem", "Szakasz letöltésénél a playlist nem támogatott.\nCsak a link szerinti egy videó szakasza töltődik le.\nFolytatod?"):
+
+        playlist = self.playlist_valtozo.get()
+        if playlist and "list=" not in url:
+            if not messagebox.askyesno(
+                    "Lejátszási lista",
+                    "A teljes lista be van pipálva, de ez nem listás link.\n"
+                    "Letöltsem egyetlen videóként?"):
                 return
-            self.playlist_var.set(False)
+            playlist = False
+            self.playlist_valtozo.set(False)
+        elif not playlist and "list=" in url:
+            if messagebox.askyesno(
+                    "Lejátszási lista",
+                    "Ez egy lejátszási lista linkje.\nLetöltsem az egész listát?"):
+                playlist = True
+                self.playlist_valtozo.set(True)
+        if szakasz and playlist:
+            if not messagebox.askyesno(
+                    "Részlet",
+                    "Részlet letöltésénél a lista nem támogatott.\n"
+                    "Csak a link szerinti egy videó részlete töltődik le. Folytatod?"):
+                return
+            playlist = False
+            self.playlist_valtozo.set(False)
+
+        # A formátumazonosítók videónként egyediek: ha közben más linket írtak
+        # be, a munkaszál újra lekérdezi őket - nem kell a felhasználót
+        # visszaküldeni az Elemzés gombhoz.
+        terv = {
+            "url": url,
+            "mod": self.mod,
+            "mappa": mappa,
+            "playlist": playlist,
+            "szakasz": szakasz,
+            "formatum": self._valasztott_formatum() if self.mod == "video" else None,
+            "friss": self.lekerdezett_url == url,
+        }
+        self.utolso_mappa = mappa
+        self._beallitasok_mentese()
 
         self.fut = True
         self.letolt_fut = True
-        self.gomb.config(state="normal", text="⛔ Megszakítás", command=self._megallitas)
-        self.lekerdezes_gomb.config(state="disabled")
-        playlist = self.playlist_var.get()
-        mappa = self.mappa_var.get()
-        fmt_valasztas = self.fmt_valasztas.get()
-        formatumok = list(self.formatumok)
-        threading.Thread(target=self._letoltes,
-                         args=(url, mod, playlist, mappa, fmt_valasztas, formatumok, szakasz),
-                         daemon=True).start()
-
-    def _letoltes(self, url, mod, playlist, mappa, fmt_valasztas, formatumok, szakasz=None):
-        """Belépési pont: szakasz esetén a saját range-letöltő, egyébként yt-dlp."""
-        self.process = None
         self._megszakitva = False
+        self.letoltes_gomb.config(text="⛔   Megszakítás")
+        self.letoltes_gomb.stilus_valt("veszely")
+        self.elemzes_gomb.config(state="disabled")
+        self._haladas_beallit(None, "Indítás…", "Fo.Horizontal.TProgressbar")
+        self._allapot("letöltés…", "kiemel")
+        threading.Thread(target=self._letoltes, args=(terv,), daemon=True).start()
+
+    def _megallitas(self):
+        if not self.letolt_fut:
+            return
+        # A jelzőt akkor is be kell állítani, ha épp nincs futó folyamat: a
+        # saját szakasz-letöltő a Range kérések között ezt figyeli.
+        self._megszakitva = True
+        self._log("⛔ Letöltés megszakítva.")
+        self._allapot("megszakítva", "figyelem")
+        self._folyamat_leallitas()
+
+    def _folyamat_leallitas(self):
+        """A futó alfolyamat és minden gyereke kilövése.
+
+        A yt-dlp külön ffmpeg folyamatot indít; sima terminate() után az
+        árván maradt ffmpeg tovább töltene a háttérben."""
+        proc = self.process
+        if not proc or proc.poll() is not None:
+            return
         try:
-            os.makedirs(mappa, exist_ok=True)
-            if szakasz:
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                           capture_output=True, timeout=10,
+                           creationflags=subprocess.CREATE_NO_WINDOW)
+        except Exception as e:
+            fajlba_naplo(f"taskkill sikertelen: {e}")
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+                proc.wait(timeout=5)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+    def _letoltes(self, terv):
+        """Belépési pont: szakasz esetén a saját Range-letöltő, egyébként yt-dlp."""
+        self.process = None
+        siker = False
+        try:
+            # Videó módban kellenek a formátumazonosítók; ha nincsenek
+            # (vagy más linkhez tartoznak), itt kérjük le őket.
+            if terv["mod"] == "video" and (not terv["friss"] or not terv["formatum"]):
+                terv["formatum"] = self._formatum_biztositas(terv["url"])
+
+            if terv["szakasz"]:
                 try:
-                    if self._szakasz_letoltes(url, mod, mappa, fmt_valasztas, szakasz):
+                    if self._szakasz_letoltes(terv):
+                        siker = True
                         return
                     if self._megszakitva:
                         return
                     self._log("↩️ Visszaesés a yt-dlp beépített szakaszolására "
-                              "(ez a YouTube fojtása miatt lassú lehet).")
+                              "(ez a YouTube fojtása miatt lassabb).")
                 except Exception as e:
                     self._log(f"⚠️ A gyors szakaszletöltő hibája: {e}")
                     fajlba_naplo(traceback.format_exc())
                     self._log("↩️ Visszaesés a yt-dlp beépített szakaszolására.")
-            self._letoltes_ytdlp(url, mod, playlist, mappa, fmt_valasztas, formatumok, szakasz)
+                if self._megszakitva:
+                    return
+            siker = self._letoltes_ytdlp(terv)
+        except Exception as e:
+            self._log(f"❌ Váratlan hiba: {e}")
+            fajlba_naplo(traceback.format_exc())
         finally:
             self.process = None
             self.fut = False
             self.letolt_fut = False
-            try:
-                if not self._destroyed:
-                    self.after(0, lambda: self.lekerdezes_gomb.config(state="normal"))
-                    self.after(0, lambda: self.gomb.config(state="normal", text="⬇  Letöltés",
-                                                           command=self._letoltes_inditasa))
-            except RuntimeError:
-                pass
+            self._letoltes_vege(siker)
 
-    # ---- Saját szakasz-letöltő (Range kérésekkel, csak a kért tartomány) ----
+    def _letoltes_vege(self, siker):
+        if self._megszakitva:
+            self._haladas_beallit(0, "Megszakítva.", "Fo.Horizontal.TProgressbar")
+        elif siker:
+            self._haladas_beallit(100, "Kész! ✅", "Siker.Horizontal.TProgressbar")
+            self._allapot("kész", "siker")
+        else:
+            self._haladas_beallit(0, "Nem sikerült – nézd meg a naplót.",
+                                  "Fo.Horizontal.TProgressbar")
+            self._allapot("hiba", "hiba")
 
-    def _szakasz_formatum(self, mod, fmt_valasztas):
-        """A szakaszhoz mp4/m4a kell, mert a byte-index a fragmentált mp4 sidx-e."""
+        def gombok():
+            self.letoltes_gomb.config(state="normal", text="↓   Letöltés")
+            self.letoltes_gomb.stilus_valt("elsodleges")
+            self.elemzes_gomb.config(state="normal")
+        self._fo_szalon(gombok)
+
+    def _formatum_biztositas(self, url):
+        """Letöltés előtti utolsó pillanatos lekérdezés, ha nincs friss lista."""
+        self._log("🔍 Formátumok frissítése a letöltés előtt…")
+        info, hiba = formatumok_lekerese(url)
+        if hiba or not info:
+            self._log(f"⚠️ Nem sikerült frissíteni a formátumokat: {hiba}")
+            return None
+        lista = formatum_csoportositas(info)
+        if not lista:
+            return None
+        self.info = info
+        self.formatumok = lista
+        self.lekerdezett_url = url
+        hossz = info.get("duration")
+        self.video_hossz = int(hossz) if hossz else self.video_hossz
+        self._fo_szalon(self._elemzes_megjelenites)
+        valasztott = lista[-1]
+        self._log(f"🎬 A legjobb minőséget használom: {valasztott['leiras']}")
+        return valasztott
+
+    # ---- saját szakasz-letöltő (Range kérésekkel, csak a kért tartomány) ----
+
+    def _szakasz_formatum(self, mod, valasztott):
+        """Formátum-kifejezés a szakaszhoz.
+
+        Fontos: csak https/DASH stream jöhet szóba, mert a HLS (m3u8)
+        változatban nincs byte-index, és a YouTube amúgy is lassabban adja."""
+        hang = ("bestaudio[ext=m4a][protocol^=http]/bestaudio[protocol^=http]/"
+                "bestaudio")
         if mod == "zene":
-            return "bestaudio[ext=m4a]"
+            return "bestaudio[protocol^=http]/bestaudio"
         if mod == "vr":
-            return "bestvideo[ext=mp4]+bestaudio[ext=m4a]"
-        try:
-            h = int(fmt_valasztas)
-        except (ValueError, TypeError):
-            h = 0
-        if h > 0:
-            return (f"bestvideo[height={h}][ext=mp4]+bestaudio[ext=m4a]/"
-                    f"bestvideo[height<={h}][ext=mp4]+bestaudio[ext=m4a]")
-        return "bestvideo[ext=mp4]+bestaudio[ext=m4a]"
+            return f"bestvideo[protocol^=http]+{hang}"
+        if valasztott and valasztott.get("format_id"):
+            azon = valasztott["format_id"]
+            magassag = valasztott.get("height") or 0
+            valtozatok = [f"{azon}+bestaudio[ext=m4a][protocol^=http]",
+                          f"{azon}+bestaudio[protocol^=http]"]
+            if magassag:
+                valtozatok.append(
+                    f"bestvideo[height={magassag}][protocol^=http]+"
+                    f"bestaudio[ext=m4a][protocol^=http]")
+            valtozatok.append(f"bestvideo[protocol^=http]+{hang}")
+            return "/".join(valtozatok)
+        return f"bestvideo[protocol^=http]+{hang}"
 
     def _boritokep_letoltes(self, info, cel):
         """Videó borítókép letöltése és jpg-vé alakítása. None, ha nem sikerült.
@@ -1134,7 +2286,6 @@ class ZeneLetolto(tk.Tk):
         jeloltek = []
         if info.get("thumbnail"):
             jeloltek.append(info["thumbnail"])
-        # Tartaléknak a legnagyobb felbontású a lista végéről visszafelé
         for t in reversed(info.get("thumbnails") or []):
             if t.get("url") and t["url"] not in jeloltek:
                 jeloltek.append(t["url"])
@@ -1177,93 +2328,152 @@ class ZeneLetolto(tk.Tk):
                 return jelolt["url"]
         return None
 
-    def _szakasz_stream(self, stream, kezd, veg, cel, cimke, forras_url=None):
+    def _szakasz_stream(self, stream, kezd, veg, cel, cimke, forras_url=None,
+                        sulyok=(0.0, 1.0)):
         """Egy stream kért szakaszának letöltése sparse fájlba. True = sikerült."""
         stream_url = stream.get("url")
         if not stream_url:
             return False
         format_id = stream.get("format_id")
+        alap_arany, arany_hossz = sulyok
 
-        fejlec = http_tartomany(stream_url, 0, SZAKASZ_FEJLEC_MERET - 1)
-        index = mp4_sidx_olvasas(fejlec)
+        fejlec, teljes = http_tartomany_info(stream_url, 0, SZAKASZ_FEJLEC_MERET - 1)
+        index = media_index_olvasas(fejlec)
         if not index:
-            self._log(f"⚠️ {cimke}: nincs sidx index a fájlban (nem fragmentált mp4).")
+            self._log(f"⚠️ {cimke}: nincs byte-index a streamben "
+                      f"({stream.get('ext')}), így nem tudok részletet vágni.")
             return False
 
-        fajlba_naplo(f"{cimke}: sidx timescale={index['timescale']} "
-                     f"szegmensek={len(index['szegmensek'])} "
-                     f"adat_kezd={index['adat_kezd']} url={stream_url[:120]}...")
+        # A fejlécnek (mp4: ftyp+moov+sidx, webm: EBML+Tracks+Cues) teljesen
+        # meg kell lennie, hogy az ffmpeg értelmezni tudja a fájlt.
+        if index["adat_kezd"] > len(fejlec):
+            fejlec += http_tartomany(stream_url, len(fejlec), index["adat_kezd"] - 1)
+        teljes = teljes or index.get("meret") or stream.get("filesize")
+        if not teljes:
+            self._log(f"⚠️ {cimke}: nem derül ki a stream mérete.")
+            return False
 
-        tartomany = sidx_byte_tartomany(index, kezd, veg)
+        fajlba_naplo(f"{cimke}: index={index['tipus']} pontok={len(index['pontok'])} "
+                     f"adat_kezd={index['adat_kezd']} teljes={teljes} "
+                     f"url={stream_url[:120]}...")
+
+        tartomany = index_byte_tartomany(index, teljes, kezd, veg)
         if not tartomany:
             self._log(f"⚠️ {cimke}: a kért időtartomány kívül esik a videón.")
             return False
         byte_kezd, byte_veg = tartomany
-        fajlba_naplo(f"{cimke}: byte tartomány {byte_kezd}-{byte_veg} "
-                     f"({byte_veg - byte_kezd} byte)")
 
-        teljes = sum(m for m, _ in index["szegmensek"]) + index["adat_kezd"]
-        kell = byte_veg - byte_kezd
+        tartomanyok = []
+        if index["tipus"] == "webm":
+            elolap = webm_elolap_tartomany(index, byte_kezd)
+            if elolap:
+                tartomanyok.append(elolap)
+        tartomanyok.append((byte_kezd, byte_veg))
+        kell = sum(v - k for k, v in tartomanyok)
+
+        fajlba_naplo(f"{cimke}: byte tartomány {byte_kezd}-{byte_veg}, "
+                     f"letöltendő szakaszok: {tartomanyok} ({kell} byte)")
         self._log(f"   {cimke}: {kell / 1024 / 1024:.0f} MB letöltése "
                   f"(a teljes {teljes / 1024 / 1024:.0f} MB helyett)")
 
         if not sparse_fajl_letrehozas(cel, teljes):
             self._log(f"⚠️ {cimke}: a célmappa nem támogatja a lyukas (sparse) fájlt, "
                       f"így {teljes / 1024 / 1024 / 1024:.1f} GB helyet foglalna. "
-                      f"Válassz NTFS meghajtót.")
+                      f"Válassz NTFS meghajtót!")
             return False
 
+        kezdet_ido = time.monotonic()
+        darabok = [(p, min(p + SZAKASZ_DARAB_MERET, szakasz_veg) - 1)
+                   for szakasz_kezd, szakasz_veg in tartomanyok
+                   for p in range(szakasz_kezd, szakasz_veg, SZAKASZ_DARAB_MERET)]
+        # A darabokat párhuzamosan kérjük le: egy Range kérés önmagában nem
+        # meríti ki a sávszélességet, több egyszerre viszont igen.
+        kozos = {"url": stream_url, "frissitve": 0, "kesz": 0}
+        url_zar = threading.Lock()
+        iro_zar = threading.Lock()
+        hibak = []
+
         with open(cel, "r+b") as f:
-            # A fejléc (ftyp+moov+sidx) kell, hogy az ffmpeg értelmezni tudja
             f.seek(0)
             f.write(fejlec[:min(index["adat_kezd"], len(fejlec))])
-            poz = byte_kezd
-            kesz = 0
-            utolso_szazalek = -10
-            url_frissitve = 0
-            while poz < byte_veg:
-                if self._megszakitva:
-                    return False
-                darab_veg = min(poz + SZAKASZ_DARAB_MERET, byte_veg) - 1
-                try:
-                    adat = http_tartomany(stream_url, poz, darab_veg)
-                except UrlLejartHiba as e:
-                    # Az aláírt URL több GB letöltése közben lejárhat vagy
-                    # tiltásra kerülhet; kérjünk újat és folytassuk onnan.
-                    if url_frissitve >= 3 or not (forras_url and format_id):
-                        raise
-                    url_frissitve += 1
-                    self._log(f"   {cimke}: a letöltési link érvénytelen lett ({e}), "
-                              f"új link kérése... ({url_frissitve}/3)")
-                    uj = self._stream_url_frissites(forras_url, format_id)
-                    if not uj:
-                        raise
-                    stream_url = uj
-                    continue
-                if not adat:
-                    raise RuntimeError(f"{cimke}: üres válasz a szervertől")
-                f.seek(poz)
-                f.write(adat)
-                poz += len(adat)
-                kesz += len(adat)
-                szazalek = kesz * 100 // max(kell, 1)
-                if szazalek >= utolso_szazalek + 10:
-                    utolso_szazalek = szazalek
-                    self._log(f"   {cimke}: {szazalek}%  "
-                              f"({kesz / 1024 / 1024:.0f}/{kell / 1024 / 1024:.0f} MB)")
+
+            def egy_darab(tartomany):
+                darab_kezd, darab_veg = tartomany
+                for _ in range(5):
+                    if self._megszakitva or hibak:
+                        return
+                    with url_zar:
+                        aktualis = kozos["url"]
+                    try:
+                        adat = http_tartomany(aktualis, darab_kezd, darab_veg)
+                    except UrlLejartHiba as e:
+                        # Az aláírt URL több GB letöltése közben lejárhat vagy
+                        # tiltásra kerülhet; kérjünk újat és folytassuk onnan.
+                        # A zár alatt frissítünk, hogy a többi szál se
+                        # kérjen közben feleslegesen újabb linket.
+                        with url_zar:
+                            if kozos["url"] == aktualis:
+                                if kozos["frissitve"] >= 3 or not (forras_url and format_id):
+                                    hibak.append(e)
+                                    return
+                                kozos["frissitve"] += 1
+                                self._log(f"   {cimke}: a letöltési link lejárt ({e}), "
+                                          f"új link kérése… ({kozos['frissitve']}/3)")
+                                uj = self._stream_url_frissites(forras_url, format_id)
+                                if not uj:
+                                    hibak.append(e)
+                                    return
+                                kozos["url"] = uj
+                        continue
+                    except Exception as e:                # hálózati hiba
+                        hibak.append(e)
+                        return
+                    if not adat:
+                        hibak.append(RuntimeError(f"{cimke}: üres válasz a szervertől"))
+                        return
+                    with iro_zar:
+                        f.seek(darab_kezd)
+                        f.write(adat)
+                        kozos["kesz"] += len(adat)
+                        kesz = kozos["kesz"]
+                    eltelt = max(time.monotonic() - kezdet_ido, 0.001)
+                    arany = kesz / max(kell, 1)
+                    self._haladas_fojtott(
+                        (alap_arany + arany * arany_hossz) * 100,
+                        f"{cimke.capitalize()} · {arany * 100:.0f}%  ·  "
+                        f"{kesz / 1048576:.0f}/{kell / 1048576:.0f} MB  ·  "
+                        f"{kesz / eltelt / 1048576:.1f} MB/s")
+                    return
+                hibak.append(RuntimeError(f"{cimke}: a darab letöltése "
+                                          f"többszöri próbálkozásra sem sikerült"))
+
+            with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=SZAKASZ_PARHUZAM) as pool:
+                list(pool.map(egy_darab, darabok))
+
+        if hibak:
+            raise hibak[0]
+        if self._megszakitva:
+            return False
+        eltelt = time.monotonic() - kezdet_ido
+        fajlba_naplo(f"{cimke}: kész, {kozos['kesz']} byte {eltelt:.1f} s alatt "
+                     f"({kozos['kesz'] / max(eltelt, 0.001) / 1048576:.1f} MB/s)")
         return True
 
-    def _szakasz_letoltes(self, url, mod, mappa, fmt_valasztas, szakasz):
+    def _szakasz_letoltes(self, terv):
         """True = kész. False = nem sikerült, jöhet a yt-dlp tartalék út."""
-        kezd, veg = szakasz
-        self._log(f"\n✂️ Szakasz letöltése: {ido_formazas(kezd)} – {ido_formazas(veg)} "
+        url, mod, mappa = terv["url"], terv["mod"], terv["mappa"]
+        kezd, veg = terv["szakasz"]
+        self._log(f"\n✂️ Részlet: {ido_formazas(kezd)} – {ido_formazas(veg)} "
                   f"({ido_formazas(veg - kezd)})")
         self._log("   Csak a kért byte-tartomány töltődik le, nem a teljes videó.")
 
-        fmt_spec = self._szakasz_formatum(mod, fmt_valasztas)
+        fmt_spec = self._szakasz_formatum(mod, terv.get("formatum"))
         fajlba_naplo(f"Szakasz mód={mod} mappa={mappa} kezd={kezd} veg={veg} "
                      f"formátum-kifejezés={fmt_spec}")
-        sort = ["-S", "abr,asr"] if mod == "zene" else ["-S", "res,fps,hdr:12,tbr"]
+        sort = (["-S", "abr,asr,proto"] if mod == "zene"
+                else ["-S", "res,fps,hdr:12,proto,tbr"])
+        self._haladas_beallit(None, "Stream URL-ek lekérdezése…")
         info, hiba = formatumok_lekerese(url, sort + ["-f", fmt_spec])
         if hiba or not info:
             self._log(f"⚠️ Nem sikerült lekérni a stream URL-eket: {hiba}")
@@ -1278,13 +2488,14 @@ class ZeneLetolto(tk.Tk):
                 return False
 
         for s in streamek:
-            kodek = s.get("vcodec") if s.get("vcodec", "none") != "none" else s.get("acodec")
-            kodek = (kodek or "?").split(".")[0]
-            if s.get("height"):
-                self._log(f"   Formátum: {s.get('height')}p {kodek} "
-                          f"{s.get('tbr') or 0:.0f} kbps")
+            van_kep = (s.get("vcodec") or "none") != "none"
+            kodek = kodek_nev(s.get("vcodec") if van_kep else s.get("acodec"))
+            if van_kep:
+                self._log(f"   Videó: {s.get('height')}p {kodek} "
+                          f"{s.get('tbr') or 0:.0f} kbps ({s.get('ext')})")
             else:
-                self._log(f"   Formátum: {kodek} {s.get('abr') or s.get('tbr') or 0:.0f} kbps")
+                self._log(f"   Hang: {kodek} "
+                          f"{s.get('abr') or s.get('tbr') or 0:.0f} kbps ({s.get('ext')})")
 
         cim = fajlnev_tisztitas(info.get("title", "video"))
         cimke_ido = f"{ido_formazas(kezd)}_{ido_formazas(veg)}".replace(":", "-")
@@ -1293,20 +2504,30 @@ class ZeneLetolto(tk.Tk):
 
         ideiglenes = []
         try:
+            # A haladásjelzőn a streamek a méretük arányában osztoznak, a
+            # végén 10% marad a vágásra/összefűzésre.
+            meretek = [max(s.get("filesize") or s.get("filesize_approx") or 1, 1)
+                       for s in streamek]
+            osszes = sum(meretek)
+            alap_arany = 0.0
             for i, stream in enumerate(streamek):
-                van_video = stream.get("vcodec", "none") != "none"
-                cimke = "videó" if van_video else "audió"
+                van_kep = (stream.get("vcodec") or "none") != "none"
+                cimke = "videó" if van_kep else "hang"
                 kiterjesztes = stream.get("ext", "mp4")
                 tmp = os.path.join(mappa, f".{alap}.{i}.{kiterjesztes}.tmp")
                 ideiglenes.append(tmp)
+                arany_hossz = 0.9 * meretek[i] / osszes
                 if not self._szakasz_stream(stream, kezd, veg, tmp, cimke,
-                                            forras_url=url):
+                                            forras_url=url,
+                                            sulyok=(alap_arany, arany_hossz)):
                     return False
+                alap_arany += arany_hossz
 
             if self._megszakitva:
                 return False
 
             media_fajlok = list(ideiglenes)
+            self._haladas_beallit(92, "Borítókép…")
             boritokep = self._boritokep_letoltes(info, os.path.join(mappa, f".{alap}.jpg"))
             if boritokep:
                 ideiglenes.append(boritokep)
@@ -1338,14 +2559,15 @@ class ZeneLetolto(tk.Tk):
                     # Explorerben. Az index a VIDEÓ streamek között értendő,
                     # ezért a média-videók számát kell megadni, nem a bemenetét.
                     video_db = sum(1 for s in streamek
-                                   if s.get("vcodec", "none") != "none")
+                                   if (s.get("vcodec") or "none") != "none")
                     args += ["-map", f"{len(media_fajlok)}:0",
                              f"-disposition:v:{video_db}", "attached_pic"]
 
             args += ["-metadata", f"title={info.get('title', '')}", cel]
 
-            self._log("   Vágás és összefűzés...")
-            if not self._ffmpeg_futtatas(args):
+            self._log("   Vágás és összefűzés…")
+            self._haladas_beallit(94, "Vágás és összefűzés…")
+            if not self._ffmpeg_futtatas(args, hossz=veg - kezd, alap_szazalek=94):
                 return False
 
             meret = os.path.getsize(cel) / 1024 / 1024
@@ -1359,19 +2581,35 @@ class ZeneLetolto(tk.Tk):
                 except OSError:
                     pass
 
-    def _ffmpeg_futtatas(self, args):
-        parancs = [FFMPEG_EXE, "-y", "-hide_banner", "-loglevel", "error", "-stats"] + args
+    def _ffmpeg_futtatas(self, args, hossz=None, alap_szazalek=None):
+        """ffmpeg futtatása. `hossz` esetén a haladást is jelzi."""
+        parancs = [FFMPEG_EXE, "-y", "-hide_banner", "-loglevel", "error"]
+        if hossz:
+            parancs += ["-progress", "pipe:1", "-nostats"]
+        parancs += args
         naplo_parancs("ffmpeg parancs", parancs)
         self.process = subprocess.Popen(
             parancs, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, encoding="utf-8", errors="replace",
             creationflags=subprocess.CREATE_NO_WINDOW)
         utolso = ""
-        for sor in self.process.stdout:
-            sor = sor.strip()
-            if sor:
-                utolso = sor
-                self._log(f"[ffmpeg] {sor}", csak_fajlba=True)
+        for nyers in self.process.stdout:
+            sor = sor_dekodolas(nyers).strip()
+            if not sor:
+                continue
+            if hossz and sor.startswith("out_time_us="):
+                try:
+                    mp = int(sor.split("=", 1)[1]) / 1e6
+                    arany = max(0.0, min(1.0, mp / max(hossz, 0.001)))
+                    self._haladas_fojtott(
+                        alap_szazalek + arany * (100 - alap_szazalek),
+                        f"Vágás és összefűzés · {arany * 100:.0f}%")
+                except ValueError:
+                    pass
+                continue
+            if "=" in sor and sor.split("=", 1)[0].islower() and " " not in sor:
+                continue                       # egyéb -progress kulcs=érték sor
+            utolso = sor
+            self._log(f"[ffmpeg] {sor}", csak_fajlba=True)
         self.process.wait()
         fajlba_naplo(f"ffmpeg kilépési kód: {self.process.returncode}")
         if self.process.returncode != 0:
@@ -1380,123 +2618,190 @@ class ZeneLetolto(tk.Tk):
             return False
         return True
 
-    def _letoltes_ytdlp(self, url, mod, playlist, mappa, fmt_valasztas, formatumok, szakasz=None):
-        video_mod = mod == "video"
+    # ------------------------------------------------------- yt-dlp letöltés --
+
+    def _letoltes_ytdlp(self, terv):
+        url, mod, mappa = terv["url"], terv["mod"], terv["mappa"]
+        szakasz, playlist = terv["szakasz"], terv["playlist"]
+        valasztott = terv.get("formatum")
 
         parancs = [YTDLP_EXE, "--ffmpeg-location", FFMPEG_MAPPA,
-                  "--windows-filenames", "--progress"]
+                   "--windows-filenames", "--newline", "--progress",
+                   "--progress-delta", "0.3", "--no-warnings",
+                   # A DASH darabokat párhuzamosan szedi le: egyetlen kapcsolat
+                   # nem meríti ki a sávszélességet, négy viszont igen.
+                   "--concurrent-fragments", "4",
+                   "--retries", "10", "--fragment-retries", "10",
+                   "--file-access-retries", "5",
+                   "--embed-chapters"]
 
-        vr_mod = mod == "vr"
+        # Minőségi sorrend: felbontás > fps > HDR > protokoll > bitráta.
+        # A protokoll azért van a bitráta ELŐTT, mert a YouTube HLS
+        # változatának hamisan magas a bitrátája: nélküle mindig az nyerne,
+        # pedig ugyanaz a stream, csak lassabb és nincs byte-indexe.
+        video_sort = ["-S", "res,fps,hdr:12,proto,tbr"]
 
-        # Minőségi sorrend: felbontás > fps > HDR > bitráta. A yt-dlp ezek után
-        # még alkalmazza a saját alapértelmezett rendezését is.
-        video_sort = ["-S", "res,fps,hdr:12,tbr"]
-
-        if vr_mod:
+        if mod == "vr":
             parancs += video_sort
-            parancs += ["-f", "bestvideo*+bestaudio/best",
+            parancs += ["-f", "bestvideo[protocol^=http]+bestaudio[protocol^=http]/"
+                              "bestvideo*+bestaudio/best",
                         "--merge-output-format", "mp4",
-                        "--embed-metadata"]
-        elif video_mod:
-            # Kiválasztott felbontás alapján format string
-            try:
-                valasztott_h = int(fmt_valasztas)
-            except (ValueError, TypeError):
-                valasztott_h = 0
-            # Keresés a lekérdezett formátumok között
-            valasztott = None
-            for fmt in formatumok:
-                if fmt["height"] == valasztott_h:
-                    valasztott = fmt
-                    break
-
-            # Ha a konkrét format_id nem elérhető (pl. lejárt URL), essünk vissza
-            # ugyanarra a felbontásra, hogy ne egy alacsonyabb minőség jöjjön.
-            if valasztott_h > 0:
-                tartalek = f"/bestvideo[height={valasztott_h}]+bestaudio/bestvideo[height<={valasztott_h}]+bestaudio/best[height<={valasztott_h}]/best"
-            else:
-                tartalek = "/bestvideo*+bestaudio/best"
-
-            if valasztott and valasztott.get("best_audio_id"):
-                fmt_str = f"{valasztott['format_id']}+{valasztott['best_audio_id']}{tartalek}"
-            elif valasztott:
-                fmt_str = f"{valasztott['format_id']}{tartalek}"
-            else:
-                fmt_str = tartalek.lstrip("/")
-
+                        "--embed-thumbnail", "--embed-metadata"]
+        elif mod == "video":
             parancs += video_sort
-            parancs += ["-f", fmt_str, "--merge-output-format", "mp4",
+            parancs += ["-f", self._video_formatum_kifejezes(valasztott),
+                        "--merge-output-format", "mp4",
                         "--embed-thumbnail", "--embed-metadata"]
         else:
-            parancs += ["-S", "abr,asr,acodec:opus",
-                        "-f", "bestaudio/best",
+            parancs += ["-S", "abr,asr,acodec:opus,proto",
+                        "-f", "bestaudio[protocol^=http]/bestaudio/best",
                         "-x", "--audio-format", "mp3", "--audio-quality", "0",
                         "--embed-thumbnail", "--embed-metadata"]
 
-        # Fájlnév sablon
-        if vr_mod:
-            nev_sablon = "%(title)s_3D_SBS.%(ext)s"
-        else:
-            nev_sablon = "%(title)s.%(ext)s"
+        nev_sablon = "%(title)s_3D_SBS.%(ext)s" if mod == "vr" else "%(title)s.%(ext)s"
 
-        # Időszakasz: csak a megadott tartományt tölti le (ffmpeg downloader),
-        # nem a teljes videót vágja ki utólag.
         if szakasz:
             kezd, veg = szakasz
             parancs += ["--download-sections", f"*{kezd}-{veg}"]
-            # A szakasz a fájlnévbe is bekerül, hogy a különböző részletek
-            # ne írják felül egymást
+            # A szakasz a fájlnévbe is bekerül, hogy a különböző részletek ne
+            # írják felül egymást (és ne higgye a yt-dlp már letöltöttnek).
             cimke = f"{ido_formazas(kezd)}_{ido_formazas(veg)}".replace(":", "-")
             nev, kit = nev_sablon.rsplit(".", 1)
             nev_sablon = f"{nev}_[{cimke}].{kit}"
-            self._log(f"✂️ Csak a(z) {ido_formazas(kezd)} – {ido_formazas(veg)} "
-                      f"szakasz töltődik le ({ido_formazas(veg - kezd)} hossz).")
 
         if playlist:
-            parancs += ["--yes-playlist", "-o", os.path.join(mappa, "%(playlist_title)s", "%(playlist_index)03d - " + nev_sablon)]
+            parancs += ["--yes-playlist", "-o",
+                        os.path.join(mappa, "%(playlist_title)s",
+                                     "%(playlist_index)03d - " + nev_sablon)]
         else:
             parancs += ["--no-playlist", "-o", os.path.join(mappa, nev_sablon)]
 
-        parancs += ["--newline", url]
+        parancs += [url]
 
-        self._log(f"\nLetöltés: {url}")
+        self._log(f"\n⬇️ Letöltés indul: {url}")
         naplo_parancs("yt-dlp parancs", parancs)
+        allapot = {"fazis": 0, "mar_letoltve": False, "hiba": False, "fajl": None}
         try:
-            env = os.environ.copy()
-            env["PYTHONIOENCODING"] = "utf-8"
-            env["PYTHONUTF8"] = "1"
             self.process = subprocess.Popen(
-                parancs,
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, encoding="utf-8", errors="replace",
-                creationflags=subprocess.CREATE_NO_WINDOW,
-                env=env
-            )
-            mar_letoltve = False
-            hiba_volt = False
-            for sor in self.process.stdout:
-                sor = sor.strip()
-                if sor:
-                    if "has already been downloaded" in sor:
-                        mar_letoltve = True
-                    if "ERROR:" in sor:
-                        hiba_volt = True
-                    self._log(sor)
+                parancs, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                creationflags=subprocess.CREATE_NO_WINDOW, env=_ytdlp_kornyezet())
+            for nyers in self.process.stdout:
+                sor = sor_dekodolas(nyers).rstrip()
+                if sor.strip():
+                    self._ytdlp_sor(sor, allapot, mod)
             self.process.wait()
 
             if self._megszakitva:
-                pass  # már logolva
-            elif mar_letoltve and not hiba_volt:
-                self._log("⚠️ Ez a fájl már le van töltve, nem kell újra letölteni!")
-            elif self.process.returncode == 0:
-                self._log("✅ Sikeres letöltés!")
-            elif hiba_volt:
-                self._log("❌ Hiba történt. Ha 'Access is denied' hibát kapsz, zárd be a lejátszót ami használja a fájlt.")
-            else:
-                self._log("❌ Hiba történt a letöltés során.")
+                return False
+            if allapot["hiba"]:
+                self._log("❌ A letöltés hibára futott. Részletek a naplóban.")
+                return False
+            if allapot["mar_letoltve"]:
+                self._log("⚠️ Ez a fájl már le van töltve ebbe a mappába.")
+                return True
+            if self.process.returncode == 0:
+                if allapot["fajl"]:
+                    self._log(f"✅ Kész: {os.path.basename(allapot['fajl'])}")
+                else:
+                    self._log("✅ Sikeres letöltés!")
+                return True
+            self._log(f"❌ A yt-dlp hibakóddal állt le ({self.process.returncode}).")
+            return False
         except Exception as e:
             self._log(f"❌ Hiba: {e}")
             fajlba_naplo(traceback.format_exc())
+            return False
+
+    def _video_formatum_kifejezes(self, valasztott):
+        """A kiválasztott minőséghez tartozó -f kifejezés.
+
+        Ha a konkrét formátumazonosító már nem érvényes, ugyanarra a
+        felbontásra esünk vissza - nem egy alacsonyabbra."""
+        if not valasztott or not valasztott.get("format_id"):
+            return ("bestvideo[protocol^=http]+bestaudio[protocol^=http]/"
+                    "bestvideo*+bestaudio/best")
+        azon = valasztott["format_id"]
+        magassag = valasztott.get("height") or 0
+        hang = valasztott.get("hang_id")
+        valtozatok = []
+        if hang:
+            valtozatok.append(f"{azon}+{hang}")
+        valtozatok.append(f"{azon}+bestaudio[protocol^=http]")
+        valtozatok.append(azon)                       # ha saját hangja van
+        if magassag:
+            valtozatok += [
+                f"bestvideo[height={magassag}][protocol^=http]+bestaudio[protocol^=http]",
+                f"bestvideo[height={magassag}]+bestaudio",
+                f"bestvideo[height<={magassag}]+bestaudio",
+                f"best[height<={magassag}]",
+            ]
+        valtozatok.append("bestvideo*+bestaudio/best")
+        return "/".join(valtozatok)
+
+    def _ytdlp_sor(self, sor, allapot, mod):
+        """Egy yt-dlp kimeneti sor feldolgozása: haladás vagy naplósor."""
+        haladas = haladas_ertelmezes(sor)
+        if haladas:
+            szazalek, meret, sebesseg, hatra = haladas
+            fazis = {0: "Letöltés", 1: "Videó", 2: "Hang"}.get(
+                allapot["fazis"] if mod != "zene" else 0, "Letöltés")
+            reszek = [f"{fazis} · {szazalek:.1f}%"]
+            if meret:
+                reszek.append(f"{meret.strip()}")
+            if sebesseg:
+                reszek.append(sebesseg)
+            if hatra:
+                reszek.append(f"hátra {hatra}")
+            # A két sáv (videó, hang) a teljes sáv felén-felén osztozik.
+            if mod != "zene" and allapot["fazis"] == 2:
+                teljes = 50 + szazalek / 2
+            elif mod != "zene" and allapot["fazis"] == 1:
+                teljes = szazalek / 2
+            else:
+                teljes = szazalek
+            self._haladas_fojtott(teljes, "  ·  ".join(reszek))
+            self._log(sor, csak_fajlba=True)
+            return
+
+        if "ERROR:" in sor:
+            allapot["hiba"] = True
+            self._log(f"❌ {ytdlp_hiba_forditas(sor)}")
+            return
+        if "has already been downloaded" in sor:
+            allapot["mar_letoltve"] = True
+
+        # A célfájl neve többször is változik (letöltés -> egyesítés -> mp3),
+        # mindig az utolsó a végleges - azt jelentjük a felhasználónak.
+        if "Destination:" in sor:
+            allapot["fajl"] = sor.split("Destination:", 1)[1].strip()
+            if sor.lstrip().startswith("[download]"):
+                allapot["fazis"] += 1
+                self._log(f"   → {os.path.basename(allapot['fajl'])}")
+            self._log(sor, csak_fajlba=True)
+            return
+        egyesites = re.search(r'Merging formats into "(.+)"', sor)
+        if egyesites:
+            allapot["fajl"] = egyesites.group(1)
+
+        # Az utómunka-fázisok: érthető magyar állapot a nyers címkék helyett.
+        for cimke, szazalek, uzenet in (
+                ("[Merger]", 96, "Videó és hang egyesítése…"),
+                ("[ExtractAudio]", 90, "MP3 készítése…"),
+                ("[ThumbnailsConvertor]", 97, "Borítókép előkészítése…"),
+                ("[EmbedThumbnail]", 98, "Borítókép beágyazása…"),
+                ("[Metadata]", 98, "Adatok beágyazása…")):
+            if cimke in sor:
+                self._haladas_beallit(szazalek, uzenet)
+                self._log(f"   {uzenet}")
+                self._log(sor, csak_fajlba=True)
+                return
+
+        # A yt-dlp belső üzenetei (kliens, formátumválasztás, takarítás) csak
+        # a naplófájlba valók - a felületen csak zajt csinálnának.
+        if sor.lstrip().startswith("[") or sor.startswith("Deleting original file"):
+            self._log(sor, csak_fajlba=True)
+            return
+        self._log(sor)
 
 
 def _globalis_hibakezeles():
@@ -1523,7 +2828,7 @@ if __name__ == "__main__":
                  f"{'exe' if getattr(sys, 'frozen', False) else 'forrás'} | "
                  f"napló: {NAPLO_FAJL}")
     try:
-        app = ZeneLetolto()
+        app = Alkalmazas()
         app.mainloop()
     except Exception:
         fajlba_naplo("VÉGZETES HIBA:\n" + traceback.format_exc())

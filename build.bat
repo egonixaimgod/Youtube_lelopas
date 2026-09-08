@@ -1,15 +1,14 @@
 @echo off
-chcp 65001 >nul
+chcp 65001 > nul
 setlocal
 
 set "APPNEV=YouTube Letolto"
-set "FORRAS=zeneletolto.py"
 
 cd /d "%~dp0"
 
-echo ============================================
-echo   %APPNEV% - build
-echo ============================================
+echo ==========================================
+echo    %APPNEV% - build
+echo ==========================================
 echo.
 
 REM --- Python ellenorzese ---
@@ -27,13 +26,10 @@ if %errorlevel%==0 (
     set "PY=python"
 )
 
-for /f "delims=" %%v in ('%PY% -c "import sys;print(sys.version.split()[0])"') do set "PYVER=%%v"
-echo [1/4] Python %PYVER% rendben.
-
 REM --- PyInstaller ellenorzese / telepitese ---
 %PY% -m PyInstaller --version >nul 2>&1
 if errorlevel 1 (
-    echo [2/4] PyInstaller nincs telepitve, telepites...
+    echo [1/3] PyInstaller telepitese...
     %PY% -m pip install --upgrade pip >nul
     %PY% -m pip install pyinstaller
     if errorlevel 1 (
@@ -42,10 +38,11 @@ if errorlevel 1 (
         exit /b 1
     )
 ) else (
-    echo [2/4] PyInstaller rendben.
+    echo [1/3] PyInstaller rendben.
 )
 
-REM --- Fut-e meg a program? Ha igen, a dist\*.exe zarolva van ---
+REM --- Fut-e meg a program? Ha igen, a dist\*.exe zarolva van, es a
+REM     PyInstaller egy nehezen erthato PermissionError-ral all le. ---
 tasklist /fi "imagename eq %APPNEV%.exe" 2>nul | find /i "%APPNEV%.exe" >nul
 if %errorlevel%==0 (
     echo.
@@ -61,34 +58,28 @@ if %errorlevel%==0 (
     )
 )
 
-REM --- Regi build torlese (a naplot NEM bantjuk: az a hibakereses alapja) ---
-echo [3/4] Regi build torlese...
-if exist "build" rmdir /s /q "build"
+REM --- A naplo NEM torolheto: gyakran az egyetlen nyoma egy hibanak ---
+echo [2/3] Regi build takaritasa (a naplo megmarad)...
 if exist "dist\zeneletolto.log" move /y "dist\zeneletolto.log" "%TEMP%\zeneletolto.log.mentes" >nul
+if exist "build" rmdir /s /q "build"
 if exist "dist" rmdir /s /q "dist"
-if exist "%APPNEV%.spec" del /q "%APPNEV%.spec"
 
 REM --- Build ---
-echo [4/4] Exe keszitese... (ez eltarthat 1-2 percig)
+echo [3/3] Exe keszitese... (ez eltarthat 1-2 percig)
 echo.
-%PY% -m PyInstaller ^
-    --onefile ^
-    --windowed ^
-    --clean ^
-    --noconfirm ^
-    --name "%APPNEV%" ^
-    "%FORRAS%"
-
+%PY% -m PyInstaller --clean --noconfirm YouTubeLetolto.spec
 if errorlevel 1 (
     echo.
     echo [HIBA] A build nem sikerult. Nezd meg a fenti uzeneteket.
+    if exist "%TEMP%\zeneletolto.log.mentes" (
+        if not exist "dist" mkdir "dist"
+        move /y "%TEMP%\zeneletolto.log.mentes" "dist\zeneletolto.log" >nul
+    )
     pause
     exit /b 1
 )
 
-REM --- Takaritas: a build mappa es a spec fajl nem kell ---
 if exist "build" rmdir /s /q "build"
-if exist "%APPNEV%.spec" del /q "%APPNEV%.spec"
 
 REM --- Korabbi naplo visszatetele ---
 if exist "%TEMP%\zeneletolto.log.mentes" (
@@ -97,16 +88,14 @@ if exist "%TEMP%\zeneletolto.log.mentes" (
 )
 
 echo.
-echo ============================================
-echo   KESZ!
-echo   dist\%APPNEV%.exe
-echo ============================================
+echo ==========================================
+echo    KESZ!  dist\%APPNEV%.exe
+echo ==========================================
 echo.
 echo Az exe onalloan fut, a yt-dlp-t es az ffmpeg-et
 echo elso inditaskor automatikusan letolti.
 echo.
 
-REM --- Dist mappa megnyitasa ---
 if exist "dist\%APPNEV%.exe" explorer "dist"
 
 pause
