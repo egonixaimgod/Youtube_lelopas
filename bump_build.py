@@ -20,7 +20,6 @@ TAVOLI_URL = ("https://raw.githubusercontent.com/egonixaimgod/"
               "Youtube_lelopas/main/zeneletolto.py")
 
 BUILD_MINTA = re.compile(r"^BUILD_SZAM\s*=\s*(\d+)", re.M)
-VERZIO_MINTA = re.compile(r'^VERZIO\s*=\s*"([\d.]+)"', re.M)
 
 with open(FORRAS, "r", encoding="utf-8") as f:
     tartalom = f.read()
@@ -48,19 +47,15 @@ tartalom = tartalom[:talalat.start(1)] + str(uj) + tartalom[talalat.end(1):]
 with open(FORRAS, "w", encoding="utf-8") as f:
     f.write(tartalom)
 
-# A verzió fő számait (pl. "2.0") a forrásból vesszük át, hogy a
-# version_info.txt ne csússzon el tőle.
-verzio = (VERZIO_MINTA.search(tartalom).group(1)
-          if VERZIO_MINTA.search(tartalom) else "2.0")
-fo, _, al = verzio.partition(".")
-fo, al = int(fo or 2), int(al or 0)
-
+# A programnak nincs verziószáma, csak build száma. A Windows numerikus mezője
+# viszont kötelezően négy elemű, ezért abba a harmadik helyre kerül a build; a
+# látható szövegmezőkbe már csak "build N".
 with open(VERZIO_INFO, "r", encoding="utf-8") as f:
     vi = f.read()
-vi = re.sub(r"filevers=\(\d+, \d+, \d+, 0\)", f"filevers=({fo}, {al}, {uj}, 0)", vi)
-vi = re.sub(r"prodvers=\(\d+, \d+, \d+, 0\)", f"prodvers=({fo}, {al}, {uj}, 0)", vi)
-vi = re.sub(r"(u'FileVersion', u')[\d.]+(')", rf"\g<1>{fo}.{al}.{uj}.0\g<2>", vi)
-vi = re.sub(r"(u'ProductVersion', u')[\d.]+(')", rf"\g<1>{fo}.{al}.{uj}.0\g<2>", vi)
+vi = re.sub(r"filevers=\(\d+, \d+, \d+, 0\)", f"filevers=(0, 0, {uj}, 0)", vi)
+vi = re.sub(r"prodvers=\(\d+, \d+, \d+, 0\)", f"prodvers=(0, 0, {uj}, 0)", vi)
+vi = re.sub(r"(u'FileVersion', u')[^']*(')", rf"\g<1>build {uj}\g<2>", vi)
+vi = re.sub(r"(u'ProductVersion', u')[^']*(')", rf"\g<1>build {uj}\g<2>", vi)
 with open(VERZIO_INFO, "w", encoding="utf-8") as f:
     f.write(vi)
 

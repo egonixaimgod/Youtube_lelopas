@@ -76,13 +76,13 @@ echo.
 echo [4/4] GitHub Release keszitese...
 where gh >nul 2>&1
 if %errorlevel%==0 (
-    gh release create "v2.0.%NEW_BUILD%" "dist/%APPNEV%.exe" ^
-        --title "YouTube Letolto v2.0 build %NEW_BUILD%" ^
+    gh release create "build-%NEW_BUILD%" "dist/%APPNEV%.exe" ^
+        --title "YouTube Letolto - build %NEW_BUILD%" ^
         --notes "Automatikus kiadas. Build %NEW_BUILD%." 2>nul
     if errorlevel 1 (
         echo      [i] A release keszites kimaradt ^(mar letezik, vagy nincs jogosultsag^).
     ) else (
-        echo      Release kesz: v2.0.%NEW_BUILD%
+        echo      Release kesz: build-%NEW_BUILD%
     )
 ) else (
     echo      [i] A "gh" parancs nem talalhato, a release keszites kimarad.

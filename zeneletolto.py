@@ -26,8 +26,7 @@ import urllib.error
 import zipfile
 import shutil
 
-VERZIO = "2.0"
-BUILD_SZAM = 3                 # a rebuild szkript növeli minden kiadásnál
+BUILD_SZAM = 4                 # a rebuild szkript növeli minden kiadásnál
 PROGRAM_NEV = "YouTube Letöltő"
 
 APP_MAPPA = os.path.join(os.getenv("LOCALAPPDATA", "."), "ZeneLetolto")
@@ -1607,6 +1606,8 @@ class Alkalmazas(tk.Tk):
             self.szakasz_veg.set(ido_formazas(veg))
         finally:
             self._szakasz_frissul = False
+        # Húzás közben élőben követi a méret a kijelölt hosszt.
+        self._meret_oszlop_frissites()
 
     def _szakasz_mezo_valtozott(self, _=None):
         if self._szakasz_frissul or not self.szakasz_valtozo.get():
@@ -1620,6 +1621,7 @@ class Alkalmazas(tk.Tk):
             self.szakasz_sav.beallit(self.video_hossz, kezd, veg, ertesit=False)
         finally:
             self._szakasz_frissul = False
+        self._meret_oszlop_frissites()
 
     def _minoseg_lista(self, szulo, sor):
         self.minoseg_keret = tk.Frame(szulo, bg=SZIN["hatter"])
@@ -1728,11 +1730,11 @@ class Alkalmazas(tk.Tk):
     # -- lábléc --------------------------------------------------------------
 
     def _lablec_epites(self):
-        """Verzió- és build szám kicsiben, bal alul - hibabejelentéskor ez az
-        első kérdés, de ne foglalja az ablak címsorát."""
+        """Build szám kicsiben, bal alul - hibabejelentéskor ez az első kérdés,
+        de ne foglalja az ablak címsorát."""
         keret = tk.Frame(self, bg=SZIN["hatter"], padx=20)
         keret.grid(row=4, column=0, sticky="ew", pady=(0, 6))
-        self._cimke(keret, f"v{VERZIO} · build {BUILD_SZAM}", 8,
+        self._cimke(keret, f"build {BUILD_SZAM}", 8,
                     SZIN["halvany2"]).pack(side="left")
 
     # -- napló ---------------------------------------------------------------
@@ -1971,6 +1973,8 @@ class Alkalmazas(tk.Tk):
         # idővonalát (szürkén), csak nem lehet húzni.
         self.szakasz_sav.beallit(hossz, kezd, veg, ertesit=be)
         self.szakasz_sav.engedelyez(be)
+        # Ki-/bekapcsoláskor a méret oszlop is visszavált a teljes méretre.
+        self._meret_oszlop_frissites()
 
     def _felulet_allapot(self, elemezve):
         """Elemzés előtt minden vezérlő szürke: nincs mit beállítani rajtuk."""
@@ -2139,7 +2143,8 @@ class Alkalmazas(tk.Tk):
             self.fa.configure(displaycolumns="#all")
             fejlecek = (("nev", "Minőség", 190), ("felbontas", "Felbontás", 110),
                         ("fps", "FPS", 60), ("kodek", "Kodek", 90),
-                        ("meret", "Méret", 90))
+                        # a "Részlet mérete" fejléc hosszabb, mint a "Méret"
+                        ("meret", "Méret", 115))
             sorok = [(f["nev"], f["felbontas"], f["fps"], f["kodek"],
                       f["meret_szoveg"]) for f in lista]
         for azon, cim, szelesseg in fejlecek:
@@ -2169,6 +2174,33 @@ class Alkalmazas(tk.Tk):
             self.minoseg_ures.config(text="Ehhez a linkhez nem találtam\n"
                                           "letölthető formátumot.")
             self.minoseg_ures.place(relx=0.5, rely=0.5, anchor="center")
+        self._meret_oszlop_frissites()
+
+    def _szakasz_arany(self):
+        """A kijelölt részlet hossza a teljes videóhoz képest (0-1)."""
+        if not self.szakasz_valtozo.get() or not self.elemezve:
+            return 1.0
+        hossz = self.video_hossz or 0
+        kezd, veg = self.szakasz_sav.kezd, self.szakasz_sav.veg
+        if not hossz or veg <= kezd:
+            return 1.0
+        return min(1.0, (veg - kezd) / hossz)
+
+    def _meret_oszlop_frissites(self):
+        """A méret oszlop mindig a TÉNYLEG letöltendő adagot mutassa.
+
+        Egy 24 órás videónál a 421 GB-os teljes méret semmit nem mond arról,
+        hogy a kért 5 perc mekkora lesz - ezért a csúszka húzása közben élőben
+        újraszámoljuk. (Becslés: a bitráta nem egyenletes a videó hosszában.)"""
+        arany = self._szakasz_arany()
+        reszlet = arany < 0.999
+        self.fa.heading("meret", text="Részlet mérete" if reszlet else "Méret")
+        for i, fmt in enumerate(self._aktualis_lista()):
+            if not self.fa.exists(str(i)):
+                continue
+            teljes = fmt.get("meret")
+            self.fa.set(str(i), "meret",
+                        meret_formazas(teljes * arany) if teljes else "–")
 
     def _boritokep_elonezet(self, info):
         """Kis előnézeti kép az info-kártyára (ffmpeg-gel png-vé alakítva,

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-Single-file Windows desktop GUI (Tkinter) that wraps `yt-dlp` for downloading audio/video from YouTube and other sites. The application lives in [zeneletolto.py](zeneletolto.py) — stdlib only, no packages, no tests. Supporting files: [YouTubeLetolto.spec](YouTubeLetolto.spec) (PyInstaller), [bump_build.py](bump_build.py) (release version bump), [ikon_keszites.py](ikon_keszites.py) (regenerates `icon_youtube_letolto.ico` with a hand-rolled PNG/ICO encoder — no Pillow), [version_info.txt](version_info.txt) (Windows file-version resource).
+Single-file Windows desktop GUI (Tkinter) that wraps `yt-dlp` for downloading audio/video from YouTube and other sites. The application lives in [zeneletolto.py](zeneletolto.py) — stdlib only, no packages, no tests. Supporting files: [YouTubeLetolto.spec](YouTubeLetolto.spec) (PyInstaller), [bump_build.py](bump_build.py) (release build-number bump), [version_info.txt](version_info.txt) (Windows file-version resource), `icon_youtube_letolto.ico` (a single 512 px entry — deliberately *not* a multi-size icon: Windows' own downscaling of the large bitmap looks sharper on this artwork than pre-baked 16/32 px entries did).
 
 **Language convention:** all identifiers, comments, log messages, and UI strings are in Hungarian (e.g. `letoltes_mappa`, `formatumok_lekerese`, `_megallitas`). Keep new code in Hungarian to match.
 
@@ -14,7 +14,6 @@ Single-file Windows desktop GUI (Tkinter) that wraps `yt-dlp` for downloading au
 python zeneletolto.py    # run (stdlib only, no pip install needed)
 .\build.bat              # build dist\YouTube Letolto.exe from the .spec
 .\rebuild_verzioszam_novelessel_es_github_pushal.bat   # bump BUILD_SZAM, build, git push, gh release
-python ikon_keszites.py  # regenerate the icon
 ```
 
 `bump_build.py` raises `BUILD_SZAM` in `zeneletolto.py` and mirrors it into `version_info.txt`. It takes `max(local, published-on-GitHub) + 1` — a release built from a stale checkout would otherwise move the published build number *backwards*.
@@ -121,7 +120,7 @@ Custom-themed Tkinter: `ttk` (clam) for the things tk lacks — `Treeview`, `Pro
 - Prefer `↓` (U+2193) over `⬇` (U+2B07) in button labels: Segoe UI has no glyph for the latter and renders a tofu box.
 - A `ttk.Combobox`'s field is styleable, but its drop-down is a plain Tk `Listbox` reachable only through `option_add("*TCombobox*Listbox.…")` — without those four lines the list opens white-on-white in a dark UI.
 - `_mod_valtas()` must call `_lista_feltoltes()` **before** `_minoseg_osszefoglalo()`: the summary reads the tree's selection, and on a mode switch the old selection index points into the *previous* mode's list (this showed "MP4" for a webm 4K source).
-- The version/build number lives in a footer row (bottom-left), not the window title — the title is just the program name.
+- The program has **no version number**, only `BUILD_SZAM`. It lives in a footer row (bottom-left); the window title is just `PROGRAM_NEV`, and the GitHub release is tagged `build-N`. The one place a numeric version survives is `version_info.txt`'s `filevers`/`prodvers`, because Windows requires a four-part tuple there — the build goes in the third slot and the user-visible strings read `build N`.
 
 **Gating.** `_felulet_allapot(elemezve)` greys out everything except the URL field until an analysis succeeds — before that there is nothing meaningful to configure. `_url_valtozott()` debounces 900 ms and analyses automatically, so the user never has to remember a separate query step.
 

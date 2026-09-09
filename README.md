@@ -80,9 +80,9 @@ Az ikon útvonala a `YouTubeLetolto.spec`-ben van, **név szerint** – a `build
 ikonra hivatkozás. Ha lecseréled a `icon_youtube_letolto.ico` fájlt ugyanezzel a névvel,
 a következő build már az újat használja, semmit nem kell átírni.
 
-Két dolgot érdemes tudni:
+Valódi `.ico` kell, nem átnevezett PNG – a Tk ablakikon csak azt fogadja el. PNG-ből
+bármelyik online vagy asztali ico-konverterrel készíthetsz ilyet.
 
-- Valódi `.ico` fájl kell (több méretet tartalmazó ikon), nem átnevezett PNG – a Tk
-  ablakikon csak ezt fogadja el.
-- A `python ikon_keszites.py` **felülírja** ezt a fájlt a beépített (piros, letöltés-nyilas)
-  ikonnal, tehát saját ikon után ne futtasd.
+A jelenlegi ikon egyetlen 512×512-es képet tartalmaz, és ez szándékos: a Windows a nagy
+képből maga skáláz a tálcára, ami ennél a logónál élesebb, mint a fájlba előre beégetett
+16/32 képpontos változatok.
