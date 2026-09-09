@@ -5,10 +5,17 @@ A `yt-dlp`-t és az `ffmpeg`-et első indításkor magától letölti, semmit ne
 
 ## Funkciók
 
-- **🎵 Zene (MP3)** – legjobb elérhető hangsáv, MP3-ba konvertálva, borítóképpel és metaadatokkal
-- **🎬 Videó (MP4)** – az összes elérhető minőség táblázatban (felbontás, FPS, kodek, méret),
+- **🎵 Zene (MP3)** – választható kimeneti bitráta (128 / 192 / V0 / 256 / **320 kbps**, alapból a
+  legjobb), borítóképpel és metaadatokkal. A forrás hangsáv mindig a legjobb elérhető, és a lista
+  ki is írja – a YouTube Opusban ~130 kbps-t ad, e fölött a nagyobb MP3 bitráta már csak a fájlt
+  hizlalja.
+- **🎬 Videó** – az összes elérhető minőség táblázatban (felbontás, FPS, kodek, méret),
   a legjobb előre kijelölve
-- **🥽 VR 3D (SBS)** – maximális minőség, `_3D_SBS` névvel (a forrásnak már side-by-side-nak kell lennie)
+- **🥽 VR 3D (SBS)** – ugyanaz a minőségválaszték, csak `_3D_SBS` névvel
+  (a forrásnak már side-by-side-nak kell lennie)
+- **Konténer** – alapból a **gyári formátum**, és a legördülő ki is írja, épp melyik az
+  (`Gyári formátum – MKV`). Kézzel átállítható MP4-re vagy MKV-ra.
+  **Egyik sem kódol újra semmit**, csak a „doboz" más
 - **✂️ Részlet letöltése csúszkával** – csak egy időintervallum, pl. egy 4 órás videóból a
   `3:00:00`–`3:20:00` rész. Nem a teljes videót tölti le és vágja ki: kiszámolja a szakaszhoz
   tartozó byte-tartományt, és párhuzamos Range kérésekkel tényleg csak azt szedi le.
@@ -25,6 +32,17 @@ A `yt-dlp`-t és az `ffmpeg`-et első indításkor magától letölti, semmit ne
 3. Ha csak egy részlet kell, pipáld be a **Csak egy részlet letöltése** opciót, és húzd a
    csúszka két fogantyúját – vagy írd be az időpontokat a mezőkbe (`3:00:00`, `20:15`, `90`).
 4. **↓ Letöltés**. A haladás sávon látszik a százalék, a sebesség és a hátralévő idő.
+
+### Konténer és minőség
+
+A YouTube DASH-t szolgál ki: a videó és a hang **külön fájlként** érkezik (VP9 → webm,
+AV1/H.264 → mp4, AAC → m4a, Opus → webm), ezért mindig össze kell fűzni őket. Ez az
+összefűzés **újracsomagolás** (`-c copy`), nem újrakódolás – a videósáv bitre ugyanaz marad,
+akármelyik konténert választod. A program soha nem kódol újra videót.
+
+Emiatt jön le egy 4K/8K (jellemzően VP9) videó natívan webm-ként: az „Automatikus" beállítás
+ilyenkor MKV-t ad. MP4-et azért érdemes választani, mert ahhoz mutat előnézetet az Explorer,
+és a régebbi lejátszók/TV-k is jobban szeretik.
 
 ### A minőségekről
 
@@ -54,8 +72,17 @@ Csak a Python beépített moduljait használja, nincs `pip install`.
 .\rebuild_verzioszam_novelessel_es_github_pushal.bat   # build szám +1, build, GitHub push + release
 ```
 
-A PyInstallert szükség esetén magától telepíti. Az ikon újragenerálása (ha módosítod):
+A PyInstallert szükség esetén magától telepíti.
 
-```powershell
-python ikon_keszites.py
-```
+### Ikoncsere
+
+Az ikon útvonala a `YouTubeLetolto.spec`-ben van, **név szerint** – a `build.bat`-ban nincs
+ikonra hivatkozás. Ha lecseréled a `icon_youtube_letolto.ico` fájlt ugyanezzel a névvel,
+a következő build már az újat használja, semmit nem kell átírni.
+
+Két dolgot érdemes tudni:
+
+- Valódi `.ico` fájl kell (több méretet tartalmazó ikon), nem átnevezett PNG – a Tk
+  ablakikon csak ezt fogadja el.
+- A `python ikon_keszites.py` **felülírja** ezt a fájlt a beépített (piros, letöltés-nyilas)
+  ikonnal, tehát saját ikon után ne futtasd.

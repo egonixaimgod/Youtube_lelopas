@@ -27,7 +27,7 @@ import zipfile
 import shutil
 
 VERZIO = "2.0"
-BUILD_SZAM = 2                 # a rebuild szkript növeli minden kiadásnál
+BUILD_SZAM = 3                 # a rebuild szkript növeli minden kiadásnál
 PROGRAM_NEV = "YouTube Letöltő"
 
 APP_MAPPA = os.path.join(os.getenv("LOCALAPPDATA", "."), "ZeneLetolto")
@@ -852,6 +852,7 @@ def formatum_csoportositas(info):
             "meret_szoveg": meret_formazas(meret),
             "format_id": f.get("format_id"),
             "height": magassag,
+            "ext": f.get("ext"),          # a forrás konténere (webm / mp4)
             "hdr": hdr,
             "hang_id": None if sajat_hang or not hang else hang.get("format_id"),
             "hang_leiras": hang_leiras(hang if not sajat_hang else f),
@@ -868,6 +869,45 @@ def hang_leiras(f):
         return "–"
     abr = f.get("abr") or f.get("tbr") or 0
     return f"{kodek_nev(f.get('acodec'))} {abr:.0f} kbps" if abr else kodek_nev(f.get("acodec"))
+
+
+# Az MP3 kimenet választható bitrátái. A 320 kbps az MP3 szabvány maximuma.
+# A valódi korlát viszont a forrás (a YouTube Opusban ~130 kbps-t ad): efölött a
+# nagyobb bitráta már csak a fájlt hizlalja, minőséget nem ad hozzá - ezért
+# szerepel a forrás is a listában, hogy a választás tájékozott legyen.
+MP3_FOKOZATOK = (
+    (128, "128 kbps", "128K", "CBR"),
+    (192, "192 kbps", "192K", "CBR"),
+    (245, "V0 · ~245 kbps", "0", "VBR"),
+    (256, "256 kbps", "256K", "CBR"),
+    (320, "320 kbps · maximum", "320K", "CBR"),
+)
+
+
+def mp3_valasztekok(info):
+    """Az MP3 kimenet minőségei, növekvő sorrendben (a legjobb az utolsó).
+
+    A forrás hangsávot mindig a legjobb elérhető adja - abból rosszabbat
+    választani semmilyen célt nem szolgálna -, itt csak a kimenet bitrátája
+    választható.
+    """
+    forras = legjobb_hang(info.get("formats") or [], mp4_baratsagos=False)
+    forras_szoveg = hang_leiras(forras)
+    hossz = info.get("duration") or 0
+    eredmeny = []
+    for kbps, nev, minoseg, tipus in MP3_FOKOZATOK:
+        meret = int(kbps * 1000 / 8 * hossz) if hossz else None
+        eredmeny.append({
+            "nev": nev,
+            "tipus": tipus,
+            "minoseg": minoseg,          # yt-dlp --audio-quality / ffmpeg érték
+            "kbps": kbps,
+            "forras": forras_szoveg,
+            "meret": meret,
+            "meret_szoveg": meret_formazas(meret),
+            "leiras": f"MP3 {nev} ({tipus}) · forrás: {forras_szoveg}",
+        })
+    return eredmeny
 
 
 # ------------------------------------------------------ haladás-értelmezés --
@@ -1140,13 +1180,14 @@ class Alkalmazas(tk.Tk):
         super().__init__()
         self.beallitas = beallitasok_betoltes()
 
-        self.title(f"{PROGRAM_NEV}  ·  v{VERZIO} (build {BUILD_SZAM})")
+        self.title(PROGRAM_NEV)
         self.configure(bg=SZIN["hatter"])
         self._ablak_meret()
         self._ikon_beallitas()
 
         # --- állapot ---
         self.formatumok = []
+        self.mp3_lista = []
         self.info = None
         self.lekerdezett_url = None
         self.video_hossz = None
@@ -1210,6 +1251,25 @@ class Alkalmazas(tk.Tk):
         st.map("Treeview.Heading", background=[("active", SZIN["keret2"])])
         st.layout("Minoseg.Treeview", st.layout("Treeview"))
 
+        # Legördülő: a mező a clam témában külön színezhető, a lenyíló lista
+        # viszont egy sima Listbox - azt csak option_add-dal lehet elérni.
+        st.configure("Sotet.TCombobox",
+                     fieldbackground=SZIN["mezo"], background=SZIN["panel2"],
+                     foreground=SZIN["szoveg"], arrowcolor=SZIN["halvany"],
+                     bordercolor=SZIN["keret"], lightcolor=SZIN["keret"],
+                     darkcolor=SZIN["keret"], relief="flat", padding=(8, 2))
+        st.map("Sotet.TCombobox",
+               fieldbackground=[("readonly", SZIN["mezo"]),
+                                ("disabled", SZIN["panel"])],
+               foreground=[("disabled", SZIN["halvany2"])],
+               arrowcolor=[("disabled", SZIN["halvany2"])],
+               bordercolor=[("focus", SZIN["kiemel"])])
+        self.option_add("*TCombobox*Listbox.background", SZIN["mezo"])
+        self.option_add("*TCombobox*Listbox.foreground", SZIN["szoveg"])
+        self.option_add("*TCombobox*Listbox.selectBackground", SZIN["kiemel"])
+        self.option_add("*TCombobox*Listbox.selectForeground", "#ffffff")
+        self.option_add("*TCombobox*Listbox.font", (BETU, 9))
+
         st.configure("Fo.Horizontal.TProgressbar",
                      troughcolor=SZIN["panel2"], bordercolor=SZIN["panel2"],
                      background=SZIN["kiemel"], lightcolor=SZIN["kiemel"],
@@ -1252,6 +1312,7 @@ class Alkalmazas(tk.Tk):
         self.grid_rowconfigure(3, weight=1, minsize=124)   # napló
 
         self._fejlec_epites()
+        self._lablec_epites()
         self._torzs_epites()
         self._akciosav_epites()
         self._naplo_epites()
@@ -1357,18 +1418,24 @@ class Alkalmazas(tk.Tk):
         keret = tk.Frame(szulo, bg=SZIN["hatter"])
         keret.grid(row=sor, column=0, sticky="ew", pady=(10, 0))
 
-        self._cimke(keret, "MIT TÖLTSÜNK LE?", 8, SZIN["halvany2"], True).pack(
-            anchor="w", pady=(0, 5))
+        fej = tk.Frame(keret, bg=SZIN["hatter"])
+        fej.pack(fill="x", pady=(0, 5))
+        self._cimke(fej, "MIT TÖLTSÜNK LE?", 8, SZIN["halvany2"], True).pack(side="left")
+        self.konteneres_cimke = self._cimke(fej, "KONTÉNER", 8, SZIN["halvany2"], True)
+        self.konteneres_cimke.pack(side="right")
 
-        valaszto = tk.Frame(keret, bg=SZIN["keret"], padx=1, pady=1)
-        valaszto.pack(anchor="w")
+        also = tk.Frame(keret, bg=SZIN["hatter"])
+        also.pack(fill="x")
+
+        valaszto = tk.Frame(also, bg=SZIN["keret"], padx=1, pady=1)
+        valaszto.pack(side="left")
         belso = tk.Frame(valaszto, bg=SZIN["panel"])
         belso.pack()
 
         self.mod = "video"
         self.mod_gombok = {}
         for ertek, szoveg in (("zene", "🎵  Zene (MP3)"),
-                              ("video", "🎬  Videó (MP4)"),
+                              ("video", "🎬  Videó"),
                               ("vr", "🥽  VR 3D (SBS)")):
             g = tk.Button(belso, text=szoveg, font=(BETU, 10),
                           relief="flat", bd=0, highlightthickness=0,
@@ -1376,6 +1443,66 @@ class Alkalmazas(tk.Tk):
                           command=lambda e=ertek: self._mod_valtas(e))
             g.pack(side="left")
             self.mod_gombok[ertek] = g
+
+        # Konténerválasztó. FONTOS: egyik változat sem kódol újra semmit, a
+        # videósáv bitre azonos - csak a "doboz" más. Alapból a forrás szerinti
+        # megy (VP9/AV1 webm -> MKV), mert az a sáv natív otthona; MP4-et azért
+        # lehet kérni, mert ahhoz ad az Explorer előnézetet, és régebbi
+        # lejátszók/TV-k is jobban szeretik.
+        self.konteneres = "auto"
+        # Az "auto" felirata elemzés után kiegészül a tényleges gyári
+        # konténerrel ("Gyári formátum – MKV"), hogy ne kelljen kitalálni,
+        # mit jelent éppen.
+        self.konteneres_nevek = {
+            "auto": "Gyári formátum",
+            "mkv": "MKV",
+            "mp4": "MP4",
+        }
+        self.konteneres_valtozo = tk.StringVar(
+            value=self.konteneres_nevek[self.konteneres])
+        self.konteneres_lista = ttk.Combobox(
+            also, textvariable=self.konteneres_valtozo, state="readonly",
+            values=list(self.konteneres_nevek.values()), width=24,
+            font=(BETU, 9), style="Sotet.TCombobox")
+        self.konteneres_lista.pack(side="right", ipady=4)
+        self.konteneres_lista.bind("<<ComboboxSelected>>", self._konteneres_valtas)
+
+    def _konteneres_valtas(self, _=None):
+        valasztott = self.konteneres_valtozo.get()
+        for kulcs, nev in self.konteneres_nevek.items():
+            if nev == valasztott:
+                self.konteneres = kulcs
+                break
+        self._beallitasok_mentese()
+        self._minoseg_osszefoglalo()
+
+    def _gyari_konteneres(self, valasztott):
+        """A kiválasztott sáv gyári konténere - amit a YouTube tényleg ad.
+
+        A VP9 (és a legtöbb 4K/8K) sáv webm-ként érkezik, aminek az MKV a
+        természetes doboza; az AV1/H.264 sávok mp4-ként."""
+        return "mkv" if (valasztott or {}).get("ext") == "webm" else "mp4"
+
+    def _konteneres_feloldas(self, valasztott):
+        """A ténylegesen használt konténer: a kézi választás, vagy a gyári.
+
+        Egyik ág sem kódol újra semmit - a sávok -c copy-val kerülnek át,
+        csak a konténer más."""
+        if self.konteneres != "auto":
+            return self.konteneres
+        return self._gyari_konteneres(valasztott)
+
+    def _konteneres_felirat_frissites(self):
+        """A "Gyári formátum" sorba beírjuk, hogy épp mit jelent."""
+        if self.elemezve and self.mod != "zene":
+            gyari = self._gyari_konteneres(self._valasztott_formatum())
+            self.konteneres_nevek["auto"] = f"Gyári formátum – {gyari.upper()}"
+        else:
+            self.konteneres_nevek["auto"] = "Gyári formátum"
+        self.konteneres_lista.config(values=list(self.konteneres_nevek.values()))
+        if self.konteneres == "auto":
+            # A .set() nem vált ki <<ComboboxSelected>>-et, tehát nem hurkol.
+            self.konteneres_valtozo.set(self.konteneres_nevek["auto"])
 
     def _mod_valtas(self, uj):
         self.mod = uj
@@ -1393,7 +1520,20 @@ class Alkalmazas(tk.Tk):
                         activeforeground="#ffffff" if aktiv else SZIN["szoveg"],
                         disabledforeground=elotr,
                         font=(BETU, 10, "bold" if aktiv else "normal"))
+        # Az MP3 kimenet konténere adott, ott nincs mit választani.
+        if uj == "zene":
+            self.konteneres_lista.pack_forget()
+            self.konteneres_cimke.pack_forget()
+        else:
+            self.konteneres_cimke.pack(side="right")
+            self.konteneres_lista.pack(side="right", ipady=4)
         self._minoseg_lathatosag()
+        # A táblázat tartalma módfüggő (felbontások vagy MP3 bitráták), ezért
+        # módváltáskor újra kell tölteni - és CSAK utána szabad az összefoglalót
+        # frissíteni, különben a régi mód kijelölésével számolna (a konténer
+        # ilyenkor mp4-et mutatna webm forrásra is).
+        if getattr(self, "elemezve", False):
+            self._lista_feltoltes()
         self._minoseg_osszefoglalo()
 
     def _szakasz_sor(self, szulo, sor):
@@ -1511,6 +1651,9 @@ class Alkalmazas(tk.Tk):
         self.fa.grid(row=0, column=0, sticky="nsew")
         self.fa.tag_configure("ajanlott", foreground=SZIN["siker"])
         self.fa.bind("<Double-1>", lambda e: self._letoltes_inditasa())
+        # Más felbontás más forráskonténert jelenthet (webm vs mp4), amitől az
+        # "Automatikus" beállítás eredménye is változik.
+        self.fa.bind("<<TreeviewSelect>>", lambda e: self._minoseg_osszefoglalo())
 
         gorgeto = ttk.Scrollbar(doboz, orient="vertical", command=self.fa.yview)
         gorgeto.grid(row=0, column=1, sticky="ns")
@@ -1524,25 +1667,28 @@ class Alkalmazas(tk.Tk):
         self.minoseg_ures.place(relx=0.5, rely=0.5, anchor="center")
 
     def _minoseg_lathatosag(self):
-        video = self.mod == "video"
-        if video:
-            self.minoseg_keret.grid()
-        else:
-            self.minoseg_keret.grid_remove()
-        # Ha a lista rejtve van, ne maradjon utána tátongó üres sáv: a
-        # nyúló súlyt is el kell venni a sorától.
-        # A minsize garantálja, hogy a lista sose lapuljon a fejlécsorra akkor
-        # sem, ha az ablak szűk - inkább a nyúló részek adják a helyet.
-        self.torzs.grid_rowconfigure(3, weight=1 if video else 0,
-                                     minsize=186 if video else 0)
+        # Mindhárom módban van mit választani, csak mást: felbontást vagy
+        # MP3 bitrátát. A minsize garantálja, hogy a lista sose lapuljon a
+        # fejlécsorra akkor sem, ha az ablak szűk.
+        self.minoseg_keret.grid()
+        self.torzs.grid_rowconfigure(3, weight=1, minsize=186)
 
     def _minoseg_osszefoglalo(self):
+        self._konteneres_felirat_frissites()
         if self.mod == "zene":
-            self._allapot_sugo("MP3 · legjobb elérhető hangminőség (~245 kbps VBR)")
-        elif self.mod == "vr":
-            self._allapot_sugo("VR: a legjobb minőség, _3D_SBS névvel jelölve")
+            self._allapot_sugo("MP3 · a forrás hangsáv mindig a legjobb elérhető")
+            return
+        # A konténer sosem jelent újrakódolást, ezt érdemes kiírni: enélkül
+        # könnyű azt hinni, hogy az mp4 "átkonvertálás" és minőségvesztés.
+        valasztott = self._valasztott_formatum()
+        elozetes = self._konteneres_feloldas(valasztott)
+        if elozetes == self._gyari_konteneres(valasztott):
+            szoveg = f"{elozetes.upper()} · gyári formátum, érintetlen sávok"
         else:
-            self._allapot_sugo("")
+            szoveg = f"{elozetes.upper()} · újracsomagolás, nem újrakódolás"
+        if self.mod == "vr":
+            szoveg += " · _3D_SBS jelölés"
+        self._allapot_sugo(szoveg)
 
     def _allapot_sugo(self, szoveg):
         self.sugo_cimke.config(text=szoveg)
@@ -1578,6 +1724,16 @@ class Alkalmazas(tk.Tk):
         self.mappa_gomb = Gomb(keret, "📂  Mappa", self._mappa_megnyitas,
                                "masodlagos", meret=10)
         self.mappa_gomb.grid(row=0, column=2, rowspan=2, sticky="e", padx=(14, 0))
+
+    # -- lábléc --------------------------------------------------------------
+
+    def _lablec_epites(self):
+        """Verzió- és build szám kicsiben, bal alul - hibabejelentéskor ez az
+        első kérdés, de ne foglalja az ablak címsorát."""
+        keret = tk.Frame(self, bg=SZIN["hatter"], padx=20)
+        keret.grid(row=4, column=0, sticky="ew", pady=(0, 6))
+        self._cimke(keret, f"v{VERZIO} · build {BUILD_SZAM}", 8,
+                    SZIN["halvany2"]).pack(side="left")
 
     # -- napló ---------------------------------------------------------------
 
@@ -1622,11 +1778,15 @@ class Alkalmazas(tk.Tk):
         if b.get("mappa"):
             self.mappa_valtozo.set(b["mappa"])
         self.mod = b.get("mod") if b.get("mod") in ("zene", "video", "vr") else "video"
+        if b.get("konteneres") in self.konteneres_nevek:
+            self.konteneres = b["konteneres"]
+            self.konteneres_valtozo.set(self.konteneres_nevek[self.konteneres])
         self._felulet_allapot(False)
         self.url_mezo.entry.focus_set()
 
     def _beallitasok_mentese(self):
-        beallitasok_mentes({"mappa": self.mappa_valtozo.get(), "mod": self.mod})
+        beallitasok_mentes({"mappa": self.mappa_valtozo.get(), "mod": self.mod,
+                            "konteneres": self.konteneres})
 
     # ------------------------------------------------------- alap segédek --
 
@@ -1825,6 +1985,7 @@ class Alkalmazas(tk.Tk):
         self.playlist_kapcsolo.config(
             state=allapot, fg=SZIN["halvany"] if elemezve else SZIN["halvany2"])
         self.letoltes_gomb.config(state=allapot)
+        self.konteneres_lista.config(state="readonly" if elemezve else "disabled")
         self._szakasz_valtozott()
 
     def _kilep(self):
@@ -1870,6 +2031,7 @@ class Alkalmazas(tk.Tk):
 
     def _formatumok_torlese(self):
         self.formatumok = []
+        self.mp3_lista = []
         self.info = None
         self.video_hossz = None
         self.lekerdezett_url = None
@@ -1893,6 +2055,7 @@ class Alkalmazas(tk.Tk):
             self.video_hossz = int(hossz) if hossz else None
             self.lekerdezett_url = url
             self.formatumok = formatum_csoportositas(info)
+            self.mp3_lista = mp3_valasztekok(info)
 
             cim = info.get("title") or "?"
             self._log(f"📹 {cim}"
@@ -1945,30 +2108,67 @@ class Alkalmazas(tk.Tk):
 
         self.info_kartya.grid(row=self._info_sor, column=0, sticky="ew", pady=(10, 0))
 
-        # minőséglista feltöltése - a legjobb legfelül, kijelölve
-        for elem in self.fa.get_children():
-            self.fa.delete(elem)
-        for i, fmt in enumerate(reversed(self.formatumok)):
-            azon = self.fa.insert(
-                "", "end", iid=str(len(self.formatumok) - 1 - i),
-                values=(fmt["nev"], fmt["felbontas"], fmt["fps"],
-                        fmt["kodek"], fmt["meret_szoveg"]),
-                tags=("ajanlott",) if i == 0 else ())
-            if i == 0:
-                self.fa.selection_set(azon)
-                self.fa.focus(azon)
-        if self.formatumok:
-            self.minoseg_ures.place_forget()
-            self.minoseg_info.config(
-                text=f"{len(self.formatumok)} minőség · hang: "
-                     f"{self.formatumok[-1]['hang_leiras']}")
-        else:
-            self.minoseg_ures.config(text="Ehhez a linkhez nem találtam\n"
-                                          "letölthető videóformátumot.")
-            self.minoseg_ures.place(relx=0.5, rely=0.5, anchor="center")
-
+        self._lista_feltoltes()
         self._felulet_allapot(True)
         self._haladas_beallit(0, "Készen áll a letöltésre.")
+
+    # -- minőséglista (módtól függő tartalommal) --
+
+    def _aktualis_lista(self):
+        """A most érvényes választéklista: videónál a felbontások, zenénél az
+        MP3 bitráták."""
+        # A VR ugyanazokból a felbontásokból választ, mint a videó mód - csak a
+        # fájlnév kap _3D_SBS jelölést.
+        return self.mp3_lista if self.mod == "zene" else self.formatumok
+
+    def _lista_feltoltes(self):
+        """A táblázat feltöltése - a legjobb legfelül, eleve kijelölve."""
+        for elem in self.fa.get_children():
+            self.fa.delete(elem)
+        lista = self._aktualis_lista()
+
+        if self.mod == "zene":
+            # Ugyanaz a táblázat, más jelentésű oszlopokkal (az FPS itt semmit
+            # nem mondana, ezért elrejtjük).
+            self.fa.configure(displaycolumns=("nev", "felbontas", "kodek", "meret"))
+            fejlecek = (("nev", "MP3 minőség", 190), ("felbontas", "Típus", 80),
+                        ("kodek", "Forrás", 140), ("meret", "Becsült méret", 110))
+            sorok = [(f["nev"], f["tipus"], "", f["forras"], f["meret_szoveg"])
+                     for f in lista]
+        else:
+            self.fa.configure(displaycolumns="#all")
+            fejlecek = (("nev", "Minőség", 190), ("felbontas", "Felbontás", 110),
+                        ("fps", "FPS", 60), ("kodek", "Kodek", 90),
+                        ("meret", "Méret", 90))
+            sorok = [(f["nev"], f["felbontas"], f["fps"], f["kodek"],
+                      f["meret_szoveg"]) for f in lista]
+        for azon, cim, szelesseg in fejlecek:
+            self.fa.heading(azon, text=cim)
+            self.fa.column(azon, width=szelesseg)
+
+        for i, ertekek in enumerate(reversed(sorok)):
+            elem = self.fa.insert("", "end", iid=str(len(sorok) - 1 - i),
+                                  values=ertekek,
+                                  tags=("ajanlott",) if i == 0 else ())
+            if i == 0:
+                self.fa.selection_set(elem)
+                self.fa.focus(elem)
+                self.fa.see(elem)
+
+        if sorok:
+            self.minoseg_ures.place_forget()
+            if self.mod == "zene":
+                self.minoseg_info.config(
+                    text=f"forrás: {lista[-1]['forras']} · efölött a nagyobb "
+                         f"bitráta már nem ad többletet")
+            else:
+                self.minoseg_info.config(
+                    text=f"{len(lista)} minőség · hang: {lista[-1]['hang_leiras']}")
+        else:
+            self.minoseg_info.config(text="")
+            self.minoseg_ures.config(text="Ehhez a linkhez nem találtam\n"
+                                          "letölthető formátumot.")
+            self.minoseg_ures.place(relx=0.5, rely=0.5, anchor="center")
 
     def _boritokep_elonezet(self, info):
         """Kis előnézeti kép az info-kártyára (ffmpeg-gel png-vé alakítva,
@@ -2014,13 +2214,16 @@ class Alkalmazas(tk.Tk):
     # -------------------------------------------------------- letöltés -----
 
     def _valasztott_formatum(self):
+        lista = self._aktualis_lista()
+        if not lista:
+            return None
         kijelolt = self.fa.selection()
         if not kijelolt:
-            return self.formatumok[-1] if self.formatumok else None
+            return lista[-1]
         try:
-            return self.formatumok[int(kijelolt[0])]
+            return lista[int(kijelolt[0])]
         except (ValueError, IndexError):
-            return self.formatumok[-1] if self.formatumok else None
+            return lista[-1]
 
     def _szakasz_ellenorzes(self):
         """None = nincs szakasz, False = hibás megadás, egyébként (kezd, veg).
@@ -2129,9 +2332,10 @@ class Alkalmazas(tk.Tk):
             "mappa": mappa,
             "playlist": playlist,
             "szakasz": szakasz,
-            "formatum": self._valasztott_formatum() if self.mod == "video" else None,
+            "formatum": self._valasztott_formatum(),
             "friss": self.lekerdezett_url == url,
         }
+        terv["konteneres"] = self._konteneres_feloldas(terv["formatum"])
         self.utolso_mappa = mappa
         self._beallitasok_mentese()
 
@@ -2186,7 +2390,8 @@ class Alkalmazas(tk.Tk):
         try:
             # Videó módban kellenek a formátumazonosítók; ha nincsenek
             # (vagy más linkhez tartoznak), itt kérjük le őket.
-            if terv["mod"] == "video" and (not terv["friss"] or not terv["formatum"]):
+            if terv["mod"] in ("video", "vr") and (not terv["friss"]
+                                                   or not terv["formatum"]):
                 terv["formatum"] = self._formatum_biztositas(terv["url"])
 
             if terv["szakasz"]:
@@ -2262,8 +2467,6 @@ class Alkalmazas(tk.Tk):
                 "bestaudio")
         if mod == "zene":
             return "bestaudio[protocol^=http]/bestaudio"
-        if mod == "vr":
-            return f"bestvideo[protocol^=http]+{hang}"
         if valasztott and valasztott.get("format_id"):
             azon = valasztott["format_id"]
             magassag = valasztott.get("height") or 0
@@ -2538,22 +2741,33 @@ class Alkalmazas(tk.Tk):
                 args = ["-ss", str(kezd), "-to", str(veg), "-i", media_fajlok[0]]
                 if boritokep:
                     args += ["-i", boritokep]
-                args += ["-map", "0:a", "-c:a", "libmp3lame", "-q:a", "0"]
+                # A szakasz-út nem a yt-dlp-n megy, ezért a választott MP3
+                # bitrátát itt is alkalmazni kell (különben mindig V0 lenne).
+                minoseg = (terv.get("formatum") or {}).get("minoseg", "0")
+                args += ["-map", "0:a", "-c:a", "libmp3lame"]
+                args += (["-q:a", "0"] if minoseg == "0"
+                         else ["-b:a", minoseg.lower()])
                 if boritokep:
                     args += ["-map", "1:v", "-c:v", "copy", "-id3v2_version", "3",
                              "-metadata:s:v", "title=Album cover",
                              "-metadata:s:v", "comment=Cover (front)"]
             else:
-                cel = os.path.join(mappa, f"{alap}.mp4")
+                # A konténer csak "doboz": a sávok -c copy-val kerülnek át,
+                # újrakódolás sehol nincs.
+                konteneres = terv.get("konteneres", "mp4")
+                mp4_kimenet = konteneres != "mkv"
+                cel = os.path.join(mappa, f"{alap}.{konteneres}")
                 args = []
                 for tmp in media_fajlok:
                     args += ["-ss", str(kezd), "-to", str(veg), "-i", tmp]
-                if boritokep:
+                if boritokep and mp4_kimenet:
                     args += ["-i", boritokep]
-                args += ["-c", "copy", "-movflags", "+faststart"]
+                args += ["-c", "copy"]
+                if mp4_kimenet:
+                    args += ["-movflags", "+faststart"]
                 for i in range(len(media_fajlok)):
                     args += ["-map", f"{i}:0"]
-                if boritokep:
+                if boritokep and mp4_kimenet:
                     # Csatolt képként fűzzük be: a .mp4 thumbnail kezelője
                     # ({9DBD2C50-...}) ezt olvassa ki, ettől lesz előnézet az
                     # Explorerben. Az index a VIDEÓ streamek között értendő,
@@ -2562,6 +2776,12 @@ class Alkalmazas(tk.Tk):
                                    if (s.get("vcodec") or "none") != "none")
                     args += ["-map", f"{len(media_fajlok)}:0",
                              f"-disposition:v:{video_db}", "attached_pic"]
+                elif boritokep:
+                    # A Matroska a borítót nem streamként, hanem csatolmányként
+                    # tárolja ("cover.jpg" néven ismerik fel a lejátszók).
+                    args += ["-attach", boritokep,
+                             "-metadata:s:t", "mimetype=image/jpeg",
+                             "-metadata:s:t", "filename=cover.jpg"]
 
             args += ["-metadata", f"title={info.get('title', '')}", cel]
 
@@ -2641,21 +2861,22 @@ class Alkalmazas(tk.Tk):
         # pedig ugyanaz a stream, csak lassabb és nincs byte-indexe.
         video_sort = ["-S", "res,fps,hdr:12,proto,tbr"]
 
-        if mod == "vr":
-            parancs += video_sort
-            parancs += ["-f", "bestvideo[protocol^=http]+bestaudio[protocol^=http]/"
-                              "bestvideo*+bestaudio/best",
-                        "--merge-output-format", "mp4",
-                        "--embed-thumbnail", "--embed-metadata"]
-        elif mod == "video":
+        if mod in ("video", "vr"):
+            # A VR ugyanaz a letöltés, mint a videó - a különbség csak a
+            # fájlnév _3D_SBS jelölése (sztereó átalakítás nem történik).
+            # A --merge-output-format CSAK a konténert szabja meg: a videó- és
+            # hangsáv másolódik (-c copy), nincs újrakódolás.
             parancs += video_sort
             parancs += ["-f", self._video_formatum_kifejezes(valasztott),
-                        "--merge-output-format", "mp4",
+                        "--merge-output-format", terv.get("konteneres", "mp4"),
                         "--embed-thumbnail", "--embed-metadata"]
         else:
+            # A forrás mindig a legjobb hangsáv; a választás csak a kimenet
+            # bitrátáját érinti ("0" = V0 VBR, egyébként pl. "320K").
+            minoseg = (valasztott or {}).get("minoseg", "0")
             parancs += ["-S", "abr,asr,acodec:opus,proto",
                         "-f", "bestaudio[protocol^=http]/bestaudio/best",
-                        "-x", "--audio-format", "mp3", "--audio-quality", "0",
+                        "-x", "--audio-format", "mp3", "--audio-quality", minoseg,
                         "--embed-thumbnail", "--embed-metadata"]
 
         nev_sablon = "%(title)s_3D_SBS.%(ext)s" if mod == "vr" else "%(title)s.%(ext)s"
