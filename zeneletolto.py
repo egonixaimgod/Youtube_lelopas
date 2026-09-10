@@ -26,7 +26,7 @@ import urllib.error
 import zipfile
 import shutil
 
-BUILD_SZAM = 10                 # a rebuild szkript növeli minden kiadásnál
+BUILD_SZAM = 11                 # a rebuild szkript növeli minden kiadásnál
 PROGRAM_NEV = "YouTube Letöltő"
 
 APP_MAPPA = os.path.join(os.getenv("LOCALAPPDATA", "."), "ZeneLetolto")
@@ -301,6 +301,21 @@ def frissites_letoltes(url, cel, halad=None):
     return cel
 
 
+def tiszta_kornyezet():
+    """Környezet a PyInstaller saját jelölései nélkül.
+
+    A befagyasztott program környezetében ott van a `_PYI_APPLICATION_HOME_DIR`
+    (a kicsomagolt `_MEI...` mappa) és a `_PYI_PARENT_PROCESS_LEVEL`. Ezeket a
+    segédszkript, és rajta keresztül az általa indított ÚJ exe is örökölné - a
+    bootloader ilyenkor azt hiszi, hogy ő egy már kicsomagolt gyerekfolyamat,
+    és a régi (időközben törölt) mappából próbálja betölteni a python DLL-t:
+    "Failed to load Python DLL ... LoadLibrary: a megadott modul nem található".
+    Ezért az újraindításnál ezeket ki kell szedni.
+    """
+    return {k: v for k, v in os.environ.items()
+            if not k.startswith("_PYI") and k != "_MEIPASS2"}
+
+
 def frissites_telepites(uj_exe, cel_exe, pid=None):
     """A futó exe lecserélése és a program újraindítása.
 
@@ -356,7 +371,8 @@ def frissites_telepites(uj_exe, cel_exe, pid=None):
     # nélkül maradna, és a tasklist/find/ping hívásai megbízhatatlanná
     # válnának. A gyerekfolyamat így is túléli a kilépésünket.
     subprocess.Popen(["cmd", "/c", bat, str(pid or os.getpid())],
-                     creationflags=subprocess.CREATE_NO_WINDOW, close_fds=True)
+                     creationflags=subprocess.CREATE_NO_WINDOW, close_fds=True,
+                     env=tiszta_kornyezet())
 
 
 # A YouTube a szekvenciális GET-et erősen fojtja (~250 kB/s), a Range kéréseket
