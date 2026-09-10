@@ -131,6 +131,22 @@ Things this split makes load-bearing:
 
 `LAP_MAX` is 8. Each tab's ranged fetch already opens `SZAKASZ_PARHUZAM` (4) connections, so eight tabs mean 32 parallel requests — more tabs would fight each other for bandwidth rather than go faster.
 
+## Self-update
+
+On startup (1.5 s after the window is up) `frissites_kereses()` asks the GitHub releases API for the latest release. The **contract with the release script** is the tag format: `legujabb_kiadas()` accepts only `re.fullmatch(r"build-(\d+)")` and reads the `.exe` asset's `browser_download_url` from it. If `rebuild_verzioszam_novelessel_es_github_pushal.bat` ever changes its tag naming, the updater silently stops finding anything — it deliberately fails *closed* (no update offered) rather than guessing a number out of an unrecognised tag.
+
+The check always runs; only the popup is conditional. `frissites_ertesites: false` in the settings suppresses `FrissitesAblak`, but the footer still gets a green `● Új verzió: build N` label that reopens the dialog on click — so dismissing is never a dead end. The dialog's "Ne jelenjen meg többé" checkbox is honoured **only on the "Később" path** (`_bezar(mentes=True)`); pressing "Telepítés" ignores it, because the program is about to be replaced anyway.
+
+Replacing a running exe is the part with the traps:
+
+- **Windows cannot overwrite a running exe**, so `frissites_telepites()` writes a small `.bat` that polls `tasklist` until our PID is gone, then `move`s the downloaded file over `sys.executable`, `start`s it and deletes itself.
+- **Write that batch file with `newline=""`.** The script contains explicit `\r\n`, and text mode would translate those to `\r\r\n`. cmd then fails to match the `:varakozas` label, `goto` dies, and the whole script exits silently having replaced nothing — with `@echo off` and no console there is no error anywhere. This cost a debugging round; the symptom is "the update ran, nothing happened, the .bat is still there".
+- **Launch it with `CREATE_NO_WINDOW` only, not `| DETACHED_PROCESS`.** Detached means no console at all, which makes the `tasklist`/`find`/`ping` pipeline unreliable. A plain child process already survives our exit.
+- **Verify the download before trusting it**: `frissites_letoltes()` rejects anything that does not start with `MZ` or is under 1 MB, so a captive-portal HTML page or a truncated transfer can never become the user's exe.
+- Running from source (`sys.frozen` false) there is nothing to swap: the button opens the releases page instead, and the checkbox is not saved on that path.
+
+`Alkalmazas.beallitasok_mentese(**valtozasok)` **merges** into the shared `self.beallitas` before writing. The old per-Lap save wrote a fixed three-key dict, which would have wiped `frissites_ertesites` the next time anyone changed a folder.
+
 ## User interface
 
 Custom-themed Tkinter: `ttk` (clam) for the things tk lacks — `Treeview`, `Progressbar`, `Scrollbar` — and plain `tk` widgets elsewhere, because only those accept arbitrary colours on Windows. `Gomb` is a flat hover-effect button whose `configure()` override mutes the background when `state=disabled` (an accent-coloured disabled button reads as clickable). `Mezo` wraps an `Entry` in a 1 px frame that turns accent-coloured on focus. `TartomanySav` is a hand-drawn two-handle range slider on a `Canvas` (Tk has no such widget); it is kept in two-way sync with the two time `Mezo`s through the `_szakasz_frissul` re-entry guard.

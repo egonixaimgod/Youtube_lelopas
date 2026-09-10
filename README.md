@@ -21,6 +21,8 @@ A `yt-dlp`-t és az `ffmpeg`-et első indításkor magától letölti, semmit ne
   tartozó byte-tartományt, és párhuzamos Range kérésekkel tényleg csak azt szedi le.
   Egy 3,5 órás 4K videóból 30 másodperc kivágása ~64 MB letöltés, 7 másodperc.
 - **Lejátszási lista** támogatás (részlet módban nem)
+- **Önfrissítés** – induláskor megnézi, van-e újabb build a GitHubon, és felajánlja a
+  telepítést. Egy kattintás: letölti, lecseréli magát és újraindul.
 - **Naplózás** – minden művelet az exe melletti `zeneletolto.log` fájlba kerül
 
 - **Lapok** – a fülsor végén lévő `+` gombbal új lapot nyithatsz (`Ctrl+T`), és egyszerre több
@@ -58,6 +60,19 @@ A YouTube minőségi címkéje nem mindig a pixelmagasság: egy 21:9-es ultrawid
 3440×1440-es változata a YouTube-nál **2160p (4K)**. A program a YouTube saját címkéjét
 használja, és mindig a `https` (DASH) streamet választja a HLS változat helyett – ugyanaz a
 tartalom, de a HLS-nek hamisan magas a bitrátája, nincs byte-indexe, és lassabban is jön.
+
+## Frissítés
+
+A program induláskor összeveti a saját build számát a GitHubon közzétett legfrissebb
+kiadással. Ha van újabb, felugrik egy ablak **Telepítés** és **Később** gombbal.
+A Telepítés letölti az új exét, lecseréli a futót és újraindítja a programot.
+
+Ha a **„Ne jelenjen meg többé"** jelölővel nyomsz a **Későbbre**, többet nem ugrik fel –
+de bal alul megmarad egy zöld `● Új verzió: build N` jelzés, amire kattintva bármikor
+előhozható ugyanez az ablak. A jelölő csak a Későbbre vonatkozik: ha telepítesz, a
+következő új verziót ugyanúgy felajánlja.
+
+Kézzel bármikor kereshetsz frissítést a lábléc **Frissítés keresése** linkjével.
 
 ## Hibakeresés
 

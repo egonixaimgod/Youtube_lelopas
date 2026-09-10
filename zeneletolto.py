@@ -26,7 +26,7 @@ import urllib.error
 import zipfile
 import shutil
 
-BUILD_SZAM = 6                 # a rebuild szkript növeli minden kiadásnál
+BUILD_SZAM = 7                 # a rebuild szkript növeli minden kiadásnál
 PROGRAM_NEV = "YouTube Letöltő"
 
 APP_MAPPA = os.path.join(os.getenv("LOCALAPPDATA", "."), "ZeneLetolto")
@@ -234,6 +234,116 @@ def ytdlp_frissites(log_callback):
 
 
 # ------------------------------------------------------- szakasz-letöltés ---
+
+# ------------------------------------------------------ önfrissítés ---------
+
+GITHUB_REPO = "egonixaimgod/Youtube_lelopas"
+FRISSITES_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+FRISSITES_OLDAL = f"https://github.com/{GITHUB_REPO}/releases/latest"
+FRISSITES_MAPPA = os.path.join(APP_MAPPA, "frissites")
+
+
+def legujabb_kiadas():
+    """A GitHubon közzétett legfrissebb build. -> (build_szam, exe_url).
+
+    A kiadás címkéje `build-N` (ezt a rebuild szkript adja), az exe pedig
+    mellékletként van feltöltve. Ha a címke nem ilyen alakú, inkább nem
+    ajánlunk frissítést, mint hogy rosszat találjunk ki belőle.
+    """
+    keres = urllib.request.Request(FRISSITES_API, headers={
+        "User-Agent": "YouTubeLetolto",
+        "Accept": "application/vnd.github+json",
+    })
+    with urllib.request.urlopen(keres, timeout=15) as valasz:
+        adat = json.loads(valasz.read().decode("utf-8"))
+
+    talalat = re.fullmatch(r"build-(\d+)", (adat.get("tag_name") or "").strip())
+    if not talalat:
+        return None, None
+    exe_url = None
+    for melleklet in adat.get("assets") or []:
+        if (melleklet.get("name") or "").lower().endswith(".exe"):
+            exe_url = melleklet.get("browser_download_url")
+            break
+    return int(talalat.group(1)), exe_url
+
+
+def frissites_letoltes(url, cel, halad=None):
+    """Az új exe letöltése. Csak akkor ad vissza sikert, ha tényleg program.
+
+    A `halad` visszahívás 0-100 közötti százalékot kap."""
+    os.makedirs(os.path.dirname(cel), exist_ok=True)
+    tmp = cel + ".tmp"
+    keres = urllib.request.Request(url, headers={"User-Agent": "YouTubeLetolto"})
+    with urllib.request.urlopen(keres, timeout=60) as valasz:
+        teljes = int(valasz.headers.get("Content-Length") or 0)
+        kesz = 0
+        with open(tmp, "wb") as f:
+            while True:
+                darab = valasz.read(256 * 1024)
+                if not darab:
+                    break
+                f.write(darab)
+                kesz += len(darab)
+                if halad and teljes:
+                    halad(kesz * 100.0 / teljes)
+
+    # Mielőtt lecserélnénk vele a futó programot, győződjünk meg róla, hogy
+    # nem egy hibaoldal vagy csonka fájl érkezett.
+    with open(tmp, "rb") as f:
+        eleje = f.read(2)
+    meret = os.path.getsize(tmp)
+    if eleje != b"MZ" or meret < 1024 * 1024:
+        os.remove(tmp)
+        raise RuntimeError(
+            f"A letöltött fájl nem futtatható program ({meret} byte).")
+    os.replace(tmp, cel)
+    return cel
+
+
+def frissites_telepites(uj_exe, cel_exe, pid=None):
+    """A futó exe lecserélése és a program újraindítása.
+
+    Windows alatt a futó exét nem lehet felülírni, ezért egy apró segéd-
+    parancsfájl végzi: megvárja, míg ez a folyamat kilép, átmozgatja az új
+    fájlt a régi helyére, elindítja, majd törli önmagát.
+    """
+    os.makedirs(FRISSITES_MAPPA, exist_ok=True)
+    bat = os.path.join(FRISSITES_MAPPA, "frissit.bat")
+    tartalom = (
+        "@echo off\r\n"
+        "setlocal\r\n"
+        'set "PID=%~1"\r\n'
+        ":varakozas\r\n"
+        'tasklist /fi "pid eq %PID%" /nh 2>nul | find /i "%PID%" >nul\r\n'
+        "if not errorlevel 1 (\r\n"
+        "    ping -n 2 127.0.0.1 >nul\r\n"
+        "    goto varakozas\r\n"
+        ")\r\n"
+        f'move /y "{uj_exe}" "{cel_exe}" >nul 2>&1\r\n'
+        "if errorlevel 1 (\r\n"
+        "    ping -n 4 127.0.0.1 >nul\r\n"
+        f'    move /y "{uj_exe}" "{cel_exe}" >nul 2>&1\r\n'
+        ")\r\n"
+        f'start "" "{cel_exe}"\r\n'
+        "endlocal\r\n"
+        'del "%~f0"\r\n'
+    )
+    # A cmd.exe a rendszer kódlapján olvassa a parancsfájlt, nem utf-8-ban.
+    # A newline="" nélkülözhetetlen: a szövegmód különben a saját \r\n-jeinket
+    # \r\r\n-re fordítaná, amitől a cmd nem találja meg a `goto` címkéjét, és a
+    # szkript némán kilép anélkül, hogy bármit lecserélne.
+    with open(bat, "w", encoding=locale.getpreferredencoding(False),
+              errors="replace", newline="") as f:
+        f.write(tartalom)
+
+    fajlba_naplo(f"frissítés telepítése: {uj_exe} -> {cel_exe}")
+    # Csak CREATE_NO_WINDOW: a DETACHED_PROCESS-szel együtt a szkript konzol
+    # nélkül maradna, és a tasklist/find/ping hívásai megbízhatatlanná
+    # válnának. A gyerekfolyamat így is túléli a kilépésünket.
+    subprocess.Popen(["cmd", "/c", bat, str(pid or os.getpid())],
+                     creationflags=subprocess.CREATE_NO_WINDOW, close_fds=True)
+
 
 # A YouTube a szekvenciális GET-et erősen fojtja (~250 kB/s), a Range kéréseket
 # viszont teljes sebességgel szolgálja ki. Az ffmpeg nem küld Range kérést
@@ -1175,6 +1285,153 @@ class TartomanySav(tk.Canvas):
                              width=2)
 
 
+class FrissitesAblak(tk.Toplevel):
+    """Értesítés új buildről, letöltés és telepítés."""
+
+    def __init__(self, alk, uj_build, exe_url):
+        super().__init__(alk, bg=SZIN["panel"])
+        self.alk = alk
+        self.uj_build = uj_build
+        self.exe_url = exe_url
+        self.folyamatban = False
+
+        self.title("Frissítés")
+        self.configure(padx=24, pady=20)
+        self.resizable(False, False)
+        self.transient(alk)
+
+        tk.Label(self, text="Új verzió érhető el", bg=SZIN["panel"],
+                 fg=SZIN["szoveg"], font=(BETU, 14, "bold")).pack(anchor="w")
+        tk.Label(self, bg=SZIN["panel"], fg=SZIN["halvany"], font=(BETU, 10),
+                 justify="left",
+                 text=(f"Jelenlegi: build {BUILD_SZAM}\n"
+                       f"Elérhető:  build {uj_build}")).pack(anchor="w", pady=(10, 0))
+
+        self.allapot = tk.Label(self, bg=SZIN["panel"], fg=SZIN["halvany2"],
+                                font=(BETU, 9), anchor="w", justify="left")
+        self.allapot.pack(anchor="w", fill="x", pady=(12, 0))
+
+        self.sav = ttk.Progressbar(self, style="Fo.Horizontal.TProgressbar",
+                                   mode="determinate", maximum=100, length=360)
+
+        self.mellozes = tk.BooleanVar(value=False)
+        tk.Checkbutton(self, text="  Ne jelenjen meg többé",
+                       variable=self.mellozes, bg=SZIN["panel"],
+                       activebackground=SZIN["panel"], fg=SZIN["halvany"],
+                       activeforeground=SZIN["szoveg"], selectcolor=SZIN["panel2"],
+                       bd=0, highlightthickness=0, cursor="hand2",
+                       font=(BETU, 9)).pack(anchor="w", pady=(14, 0))
+
+        gombok = tk.Frame(self, bg=SZIN["panel"])
+        gombok.pack(anchor="e", pady=(16, 0))
+        self.kesobb_gomb = Gomb(gombok, "Később", self._bezar, "masodlagos")
+        self.kesobb_gomb.pack(side="right")
+        self.frissit_gomb = Gomb(gombok, "Telepítés", self._inditas,
+                                 "elsodleges", vastag=True)
+        self.frissit_gomb.pack(side="right", padx=(0, 8))
+        if not getattr(sys, "frozen", False):
+            # Forrásból futtatva nincs mit lecserélni.
+            self.allapot.config(
+                text="Forrásból futtatva a csere nem automatikus –\n"
+                     "a Telepítés a letöltési oldalt nyitja meg.")
+
+        self.protocol("WM_DELETE_WINDOW", self._bezar)
+        self.update_idletasks()
+        self._kozepre()
+        self.grab_set()
+
+    def _kozepre(self):
+        sz, m = self.winfo_width(), self.winfo_height()
+        x = self.alk.winfo_rootx() + (self.alk.winfo_width() - sz) // 2
+        y = self.alk.winfo_rooty() + (self.alk.winfo_height() - m) // 3
+        self.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+
+    def _mellozes_mentese(self):
+        if self.mellozes.get():
+            self.alk.beallitasok_mentese(frissites_ertesites=False)
+            fajlba_naplo("a felhasználó kikapcsolta a frissítési értesítést")
+
+    def _bezar(self, mentes=True):
+        """A jelölőnégyzet CSAK a "Később" úton számít - ha telepít, akkor
+        úgyis frissül, tehát nincs mit elnyomni."""
+        if self.folyamatban:
+            return
+        if mentes:
+            self._mellozes_mentese()
+        try:
+            self.grab_release()
+        except tk.TclError:
+            pass
+        self.destroy()
+
+    def _inditas(self):
+        if not getattr(sys, "frozen", False):
+            os.startfile(FRISSITES_OLDAL)
+            self._bezar(mentes=False)
+            return
+        if not self.exe_url:
+            messagebox.showwarning(
+                "Frissítés",
+                "A kiadáshoz nincs feltöltve program-fájl.\n"
+                "Töltsd le kézzel a GitHubról.", parent=self)
+            return
+        futo = [l for l in self.alk.lapok if l.letolt_fut]
+        if futo and not messagebox.askyesno(
+                "Frissítés",
+                f"{len(futo)} lapon még fut letöltés, és a frissítéshez a "
+                f"program újraindul.\nMegszakítod és frissítesz?", parent=self):
+            return
+
+        self.folyamatban = True
+        self.frissit_gomb.config(state="disabled")
+        self.kesobb_gomb.config(state="disabled")
+        self.sav.pack(fill="x", pady=(8, 0), before=self.allapot)
+        self.allapot.config(text="Letöltés…", fg=SZIN["halvany"])
+        threading.Thread(target=self._letoltes_worker, daemon=True).start()
+
+    def _letoltes_worker(self):
+        cel = os.path.join(FRISSITES_MAPPA, "YouTube Letolto.exe")
+        try:
+            frissites_letoltes(self.exe_url, cel, self._halad)
+        except Exception as e:
+            fajlba_naplo(f"frissítés letöltése sikertelen: {e}")
+            self.alk._fo_szalon(self._hiba, str(e))
+            return
+        self.alk._fo_szalon(self._telepites, cel)
+
+    def _halad(self, szazalek):
+        self.alk._fo_szalon(self._halad_kiiras, szazalek)
+
+    def _halad_kiiras(self, szazalek):
+        try:
+            self.sav["value"] = szazalek
+            self.allapot.config(text=f"Letöltés… {szazalek:.0f}%")
+        except tk.TclError:
+            pass
+
+    def _hiba(self, uzenet):
+        self.folyamatban = False
+        try:
+            self.allapot.config(text=f"Nem sikerült: {uzenet}", fg=SZIN["hiba"])
+            self.frissit_gomb.config(state="normal")
+            self.kesobb_gomb.config(state="normal")
+            self.sav.pack_forget()
+        except tk.TclError:
+            pass
+
+    def _telepites(self, uj_exe):
+        self.allapot.config(text="Telepítés – a program újraindul…",
+                            fg=SZIN["siker"])
+        self.update_idletasks()
+        try:
+            frissites_telepites(uj_exe, os.path.abspath(sys.executable))
+        except Exception as e:
+            fajlba_naplo(f"frissítés telepítése sikertelen: {e}")
+            self._hiba(str(e))
+            return
+        self.alk.kilepes_frissiteshez()
+
+
 class FeluletSegedek:
     """Az ablak és a lapok közös felületi apróságai."""
 
@@ -1728,8 +1985,10 @@ class Lap(tk.Frame, FeluletSegedek):
         self.url_mezo.entry.focus_set()
 
     def _beallitasok_mentese(self):
-        beallitasok_mentes({"mappa": self.mappa_valtozo.get(), "mod": self.mod,
-                            "konteneres": self.konteneres})
+        # Az ablakon keresztül megy, hogy a többi beállítás (pl. a frissítési
+        # értesítés kapcsolója) ne vesszen el a mentéskor.
+        self.alk.beallitasok_mentese(mappa=self.mappa_valtozo.get(),
+                                     mod=self.mod, konteneres=self.konteneres)
 
     # ------------------------------------------------------- alap segédek --
 
@@ -3040,6 +3299,8 @@ class Alkalmazas(tk.Tk, FeluletSegedek):
         self.lapok = []
         self.aktiv_lap = None
         self._lap_szamlalo = 0
+        self._frissites_ablak_nyitva = None
+        self.elerheto_frissites = None      # (build, exe_url), ha van újabb
 
         self._ablak_meret()
         self._ikon_beallitas()
@@ -3052,6 +3313,8 @@ class Alkalmazas(tk.Tk, FeluletSegedek):
         self.bind_all("<Control-w>", lambda e: self.lap_bezaras(self.aktiv_lap))
         self.bind_all("<Control-Tab>", lambda e: self.kovetkezo_lap())
         threading.Thread(target=self._init_eszkozok, daemon=True).start()
+        # Kis késleltetéssel, hogy a főablak biztosan előbb megjelenjen.
+        self.after(1500, self.frissites_kereses)
 
     # ------------------------------------------------------------ felület --
 
@@ -3185,6 +3448,20 @@ class Alkalmazas(tk.Tk, FeluletSegedek):
         keret.grid(row=3, column=0, sticky="ew", pady=(0, 6))
         self._cimke(keret, f"build {BUILD_SZAM}", 8,
                     SZIN["halvany2"]).pack(side="left")
+        self._cimke(keret, "·", 8, SZIN["halvany2"]).pack(side="left", padx=6)
+        # Kézi keresés: akkor is működik, ha az értesítést kikapcsolták.
+        link = self._cimke(keret, "Frissítés keresése", 8, SZIN["halvany2"],
+                           cursor="hand2")
+        link.pack(side="left")
+        link.bind("<Button-1>", lambda e: self.frissites_kereses(kezi=True))
+        link.bind("<Enter>", lambda e: link.config(fg=SZIN["kiemel"]))
+        link.bind("<Leave>", lambda e: link.config(fg=SZIN["halvany2"]))
+
+        # Ha van újabb build, itt marad egy kis jelzés akkor is, ha a felugró
+        # ablakot elnyomták - erre kattintva bármikor előhozható.
+        self.frissites_jelzo = self._cimke(keret, "", 8, SZIN["siker"],
+                                           cursor="hand2")
+        self.frissites_jelzo.bind("<Button-1>", lambda e: self._frissites_elohozas())
 
     # ----------------------------------------------------------- lapfülek --
 
@@ -3363,6 +3640,71 @@ class Alkalmazas(tk.Tk, FeluletSegedek):
                 fajlba_naplo(f"{cimke} verzió: {elso[0] if elso else '?'}")
             except Exception as e:
                 fajlba_naplo(f"{cimke} verzió lekérése sikertelen: {e}")
+
+    def beallitasok_mentese(self, **valtozasok):
+        """Beolvasztja a változásokat a közös beállításokba, majd ment.
+
+        Azért nem felülírással, mert több forrás is ír bele (lapok, frissítési
+        párbeszéd) - a teljes szótár kiírása eltüntetné a másik beállításait."""
+        self.beallitas.update(valtozasok)
+        beallitasok_mentes(self.beallitas)
+
+    # --------------------------------------------------------- frissítés --
+
+    def frissites_kereses(self, kezi=False):
+        """Van-e újabb build a GitHubon. Induláskor automatikusan fut, de a
+        lábléc linkjéről kézzel is indítható.
+
+        A keresés akkor is lefut, ha a felugró ablakot kikapcsolták - a
+        láblécbeli jelzés ilyenkor is megjelenik."""
+        threading.Thread(target=self._frissites_worker, args=(kezi,),
+                         daemon=True).start()
+
+    def _frissites_worker(self, kezi):
+        try:
+            uj, exe_url = legujabb_kiadas()
+        except Exception as e:
+            fajlba_naplo(f"frissítés-ellenőrzés sikertelen: {e}")
+            if kezi:
+                self._fo_szalon(messagebox.showwarning, "Frissítés",
+                                f"Nem sikerült ellenőrizni a frissítést:\n{e}")
+            return
+        fajlba_naplo(f"frissítés-ellenőrzés: helyi build {BUILD_SZAM}, "
+                     f"GitHubon {uj}")
+        if uj and uj > BUILD_SZAM:
+            self.elerheto_frissites = (uj, exe_url)
+            self._fo_szalon(self._frissites_jelzo_frissites)
+            if kezi or self.beallitas.get("frissites_ertesites", True):
+                self._fo_szalon(self._frissites_ablak, uj, exe_url)
+        elif kezi:
+            self._fo_szalon(messagebox.showinfo, "Frissítés",
+                            f"A legfrissebb verziót használod (build {BUILD_SZAM}).")
+
+    def _frissites_jelzo_frissites(self):
+        if not self.elerheto_frissites:
+            return
+        uj = self.elerheto_frissites[0]
+        self.frissites_jelzo.config(text=f"●  Új verzió: build {uj}")
+        self.frissites_jelzo.pack(side="left", padx=(10, 0))
+
+    def _frissites_elohozas(self):
+        if self.elerheto_frissites:
+            self._frissites_ablak(*self.elerheto_frissites)
+
+    def _frissites_ablak(self, uj, exe_url):
+        if getattr(self, "_frissites_ablak_nyitva", None):
+            return
+        ablak = FrissitesAblak(self, uj, exe_url)
+        self._frissites_ablak_nyitva = ablak
+        ablak.bind("<Destroy>",
+                   lambda e: setattr(self, "_frissites_ablak_nyitva", None))
+
+    def kilepes_frissiteshez(self):
+        """Kilépés kérdés nélkül: a segédszkript már vár a folyamat végére."""
+        self._destroyed = True
+        for lap in self.lapok:
+            lap.lezaras()
+        self.destroy()
 
     def _kilep(self):
         futo = [l for l in self.lapok if l.letolt_fut]
