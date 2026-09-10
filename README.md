@@ -67,10 +67,12 @@ A program induláskor összeveti a saját build számát a GitHubon közzétett 
 kiadással. Ha van újabb, felugrik egy ablak **Telepítés** és **Később** gombbal.
 A Telepítés letölti az új exét, lecseréli a futót és újraindítja a programot.
 
-Ha a **„Ne jelenjen meg többé"** jelölővel nyomsz a **Későbbre**, többet nem ugrik fel –
-de bal alul megmarad egy zöld `● Új verzió: build N` jelzés, amire kattintva bármikor
-előhozható ugyanez az ablak. A jelölő csak a Későbbre vonatkozik: ha telepítesz, a
-következő új verziót ugyanúgy felajánlja.
+A **„Ne jelenjen meg többé"** jelölő megjegyzett beállítás: mindkét gomb (Telepítés és
+Később) elmenti, és amikor legközelebb előjön az ablak, már bepipálva nyílik. Ha kiveszed
+a pipát, újra kapsz értesítést.
+
+Bepipálva többet nem ugrik fel magától – de bal alul megmarad egy zöld
+`● Új verzió: build N` jelzés, amire kattintva bármikor előhozható ugyanez az ablak.
 
 Kézzel bármikor kereshetsz frissítést a lábléc **Frissítés keresése** linkjével.
 

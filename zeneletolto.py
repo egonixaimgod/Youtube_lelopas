@@ -26,7 +26,7 @@ import urllib.error
 import zipfile
 import shutil
 
-BUILD_SZAM = 12                 # a rebuild szkript növeli minden kiadásnál
+BUILD_SZAM = 13                 # a rebuild szkript növeli minden kiadásnál
 PROGRAM_NEV = "YouTube Letöltő"
 
 APP_MAPPA = os.path.join(os.getenv("LOCALAPPDATA", "."), "ZeneLetolto")
@@ -1344,7 +1344,11 @@ class FrissitesAblak(tk.Toplevel):
         self.sav = ttk.Progressbar(self, style="Fo.Horizontal.TProgressbar",
                                    mode="determinate", maximum=100, length=360)
 
-        self.mellozes = tk.BooleanVar(value=False)
+        # A jelölő a mentett beállítást tükrözi: ha egyszer bepipálták, akkor
+        # legközelebb - például a lábléc jelzéséről előhozva - is bepipálva
+        # nyílik. Kipipálva viszont vissza is kapcsolható az értesítés.
+        self.mellozes = tk.BooleanVar(
+            value=not alk.beallitas.get("frissites_ertesites", True))
         tk.Checkbutton(self, text="  Ne jelenjen meg többé",
                        variable=self.mellozes, bg=SZIN["panel"],
                        activebackground=SZIN["panel"], fg=SZIN["halvany"],
@@ -1377,13 +1381,18 @@ class FrissitesAblak(tk.Toplevel):
         self.geometry(f"+{max(x, 0)}+{max(y, 0)}")
 
     def _mellozes_mentese(self):
-        if self.mellozes.get():
-            self.alk.beallitasok_mentese(frissites_ertesites=False)
-            fajlba_naplo("a felhasználó kikapcsolta a frissítési értesítést")
+        """A jelölő állapotát mindkét gomb menti (Telepítés és Később).
+
+        Nem csak bekapcsolni lehet vele: a pipa kivétele visszakapcsolja az
+        értesítést."""
+        ertesites = not self.mellozes.get()
+        if ertesites != self.alk.beallitas.get("frissites_ertesites", True):
+            self.alk.beallitasok_mentese(frissites_ertesites=ertesites)
+            fajlba_naplo("frissítési értesítés: "
+                         + ("bekapcsolva" if ertesites else "kikapcsolva"))
 
     def _bezar(self, mentes=True):
-        """A jelölőnégyzet CSAK a "Később" úton számít - ha telepít, akkor
-        úgyis frissül, tehát nincs mit elnyomni."""
+        """A `mentes=False` csak akkor kell, ha a hívó már mentett."""
         if self.folyamatban:
             return
         if mentes:
@@ -1395,6 +1404,8 @@ class FrissitesAblak(tk.Toplevel):
         self.destroy()
 
     def _inditas(self):
+        # A jelölő a Telepítés gombnál is számít.
+        self._mellozes_mentese()
         if not getattr(sys, "frozen", False):
             os.startfile(FRISSITES_OLDAL)
             self._bezar(mentes=False)

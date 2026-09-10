@@ -136,7 +136,9 @@ Things this split makes load-bearing:
 
 On startup (1.5 s after the window is up) `frissites_kereses()` asks the GitHub releases API for the latest release. The **contract with the release script** is the tag format: `legujabb_kiadas()` accepts only `re.fullmatch(r"build-(\d+)")` and reads the `.exe` asset's `browser_download_url` from it. If `rebuild_verzioszam_novelessel_es_github_pushal.bat` ever changes its tag naming, the updater silently stops finding anything — it deliberately fails *closed* (no update offered) rather than guessing a number out of an unrecognised tag.
 
-The check always runs; only the popup is conditional. `frissites_ertesites: false` in the settings suppresses `FrissitesAblak`, but the footer still gets a green `● Új verzió: build N` label that reopens the dialog on click — so dismissing is never a dead end. The dialog's "Ne jelenjen meg többé" checkbox is honoured **only on the "Később" path** (`_bezar(mentes=True)`); pressing "Telepítés" ignores it, because the program is about to be replaced anyway.
+The check always runs; only the popup is conditional. `frissites_ertesites: false` in the settings suppresses `FrissitesAblak`, but the footer still gets a green `● Új verzió: build N` label that reopens the dialog on click — so dismissing is never a dead end.
+
+The "Ne jelenjen meg többé" checkbox is a **persisted preference, not a one-shot dismissal**: it opens reflecting the stored value (`value=not beallitas.get("frissites_ertesites", True)`), both buttons save it, and clearing it re-enables notifications. Keep those three properties together — a checkbox that saves but reopens blank looks broken the second time it is seen.
 
 Replacing a running exe is the part with the traps:
 
