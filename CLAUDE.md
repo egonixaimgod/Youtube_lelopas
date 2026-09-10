@@ -125,6 +125,8 @@ Things this split makes load-bearing:
 - **File-log lines carry `[lap N]` next to `[pid]`.** One process now runs several downloads, so the `[pid]` marker alone no longer separates them. `Lap._fajlnaplo()` adds the label; module-level helpers take an optional `lap=` argument (`fajlba_naplo`, `naplo_parancs`, `formatumok_lekerese`) so the yt-dlp argv lines are attributable too.
 - **Temp filenames include the tab id** (`.l2.` in `_szakasz_letoltes`, `elonezet_2.png` for the preview). Two tabs downloading the *same* video and range would otherwise write into each other's sparse temp files.
 - **`_letoltes_vege()` sets `lap_allapot`**, which drives the tab chip: `✓` (green) when finished, `%` while downloading, `◌` while analysing, `✕` on error. That is how a finished download is visible from another tab.
+- **A tab's *displayed* name comes from its position, its *identity* from `azonosito`.** `ful_felirat()` uses `alk.lapok.index(self)` ("Új lap", "Új lap 2", …) so closing tabs renumbers the rest — otherwise a single open tab ends up labelled "Új lap 17" after some churn. `azonosito` stays monotonic because the log label and the temp filenames key off it, and reusing a number could collide with a tab that is still writing.
+- The `+` button is re-created inside `_lapcsik_ujraepites()` at grid column `len(lapok)` — i.e. directly after the rightmost tab, browser-style — with the filler column after it.
 - `_kilep()` asks before killing tabs that are still downloading, then calls `lezaras()` on each.
 
 `LAP_MAX` is 8. Each tab's ranged fetch already opens `SZAKASZ_PARHUZAM` (4) connections, so eight tabs mean 32 parallel requests — more tabs would fight each other for bandwidth rather than go faster.

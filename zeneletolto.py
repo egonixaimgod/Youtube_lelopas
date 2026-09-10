@@ -26,7 +26,7 @@ import urllib.error
 import zipfile
 import shutil
 
-BUILD_SZAM = 5                 # a rebuild szkript növeli minden kiadásnál
+BUILD_SZAM = 6                 # a rebuild szkript növeli minden kiadásnál
 PROGRAM_NEV = "YouTube Letöltő"
 
 APP_MAPPA = os.path.join(os.getenv("LOCALAPPDATA", "."), "ZeneLetolto")
@@ -1243,7 +1243,19 @@ class Lap(tk.Frame, FeluletSegedek):
         }.get(self.lap_allapot, ("●", "halvany2"))
 
     def ful_felirat(self):
-        cim = self.lap_cim or f"Új lap {self.azonosito}"
+        """A fülön látszó név.
+
+        Cím nélkül a lap SORSZÁMÁT mutatjuk, nem a belső azonosítóját: lapok
+        bezárása után a maradék átszámozódik, tehát egyetlen nyitott lap
+        mindig "Új lap" marad. (A belső azonosító közben végig egyedi, mert
+        arra hivatkozik a napló és az ideiglenes fájlnevek is.)"""
+        cim = self.lap_cim
+        if not cim:
+            try:
+                sorszam = self.alk.lapok.index(self) + 1
+            except ValueError:
+                sorszam = 1
+            cim = "Új lap" if sorszam == 1 else f"Új lap {sorszam}"
         return cim if len(cim) <= 26 else cim[:25] + "…"
 
     def _ful_frissites(self):
@@ -3160,13 +3172,11 @@ class Alkalmazas(tk.Tk, FeluletSegedek):
         tk.Frame(self, bg=SZIN["keret"], height=1).grid(row=1, column=0,
                                                         sticky="sew")
 
-        self.uj_gomb = Gomb(keret, "+", self.uj_lap, "masodlagos", meret=13,
-                            vastag=True, padx=12, pady=3)
-        self.uj_gomb.pack(side="left", padx=(16, 8), pady=6)
-
+        # A "+" gomb a fülök közé, a jobb szélső mögé kerül (lásd
+        # _lapcsik_ujraepites) - ahogy a böngészőkben megszokott.
         self.lap_csik = tk.Frame(keret, bg=SZIN["panel2"])
         self.lap_csik.pack(side="left", fill="both", expand=True,
-                           padx=(0, 16), pady=6)
+                           padx=16, pady=6)
 
     def _lablec_epites(self):
         """Build szám kicsiben, bal alul - hibabejelentéskor ez az első kérdés,
@@ -3249,9 +3259,16 @@ class Alkalmazas(tk.Tk, FeluletSegedek):
                 self.lap_csik.grid_columnconfigure(
                     i, weight=0, uniform="", minsize=self.FUL_SZELES)
             self._ful_epites(lap, i)
-        # A maradék helyet egy üres oszlop nyeli el, ha a fülek nem töltik ki.
+
+        # "+" közvetlenül a jobb szélső fül mögött, mint a böngészőkben.
+        n = len(self.lapok)
+        self.uj_gomb = Gomb(self.lap_csik, "+", self.uj_lap, "masodlagos",
+                            meret=13, vastag=True, padx=11, pady=2)
+        self.uj_gomb.grid(row=0, column=n, sticky="w", padx=(2, 0))
+        # A maradék helyet egy üres oszlop nyeli el, hogy a fülek ne nyúljanak.
+        # Ha viszont szűkösen vagyunk, minden hely a füleké.
         self.lap_csik.grid_columnconfigure(
-            len(self.lapok), weight=0 if szuk else 1, uniform="", minsize=0)
+            n + 1, weight=0 if szuk else 1, uniform="", minsize=0)
 
     def _ful_epites(self, lap, oszlop):
         aktiv = lap is self.aktiv_lap
