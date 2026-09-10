@@ -26,7 +26,7 @@ import urllib.error
 import zipfile
 import shutil
 
-BUILD_SZAM = 4                 # a rebuild szkript növeli minden kiadásnál
+BUILD_SZAM = 5                 # a rebuild szkript növeli minden kiadásnál
 PROGRAM_NEV = "YouTube Letöltő"
 
 APP_MAPPA = os.path.join(os.getenv("LOCALAPPDATA", "."), "ZeneLetolto")
@@ -51,14 +51,16 @@ NAPLO_FAJL = os.path.join(_naplo_alapmappa(), "zeneletolto.log")
 _naplo_zar = threading.Lock()
 
 
-def fajlba_naplo(szoveg):
+def fajlba_naplo(szoveg, lap=""):
     """Minden naplósort kiír a fájlba. Ha az exe mellé nem lehet írni
     (pl. Program Files), átvált a LOCALAPPDATA mappára."""
     global NAPLO_FAJL
     ido = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     # A PID nélkül olvashatatlan a napló, ha egyszerre több példány fut:
     # a sorok összekeverednek, és úgy tűnik, mintha egy példány töltene kettőt.
-    sor = f"[{ido}][{os.getpid()}] {szoveg}\n"
+    # A lapazonosító ugyanezért kell: egy példányon belül is futhat több
+    # letöltés egyszerre, külön lapokon.
+    sor = f"[{ido}][{os.getpid()}]{lap} {szoveg}\n"
     with _naplo_zar:
         for _ in range(2):
             try:
@@ -85,7 +87,7 @@ def fajlba_naplo(szoveg):
                     return
 
 
-def naplo_parancs(cimke, parancs):
+def naplo_parancs(cimke, parancs, lap=""):
     """Parancssor naplózása. A googlevideo URL-ek aláírt tokent tartalmaznak és
     több ezer karakteresek, ezért azokat rövidítjük."""
     reszek = []
@@ -94,7 +96,7 @@ def naplo_parancs(cimke, parancs):
             reszek.append(r[:160] + f"...[+{len(r) - 160} karakter]")
         else:
             reszek.append(r)
-    fajlba_naplo(f"{cimke}: {' '.join(reszek)}")
+    fajlba_naplo(f"{cimke}: {' '.join(reszek)}", lap)
 
 
 def sor_dekodolas(nyers):
@@ -623,7 +625,7 @@ def _ytdlp_kornyezet():
     return env
 
 
-def formatumok_lekerese(url, extra=None):
+def formatumok_lekerese(url, extra=None, lap=""):
     """Lekéri az elérhető formátumokat yt-dlp -j segítségével.
 
     `extra` további kapcsolókat fűz be - a szakaszletöltő ezzel adja át a
@@ -631,7 +633,7 @@ def formatumok_lekerese(url, extra=None):
     listát a közvetlen stream URL-ekkel.
     """
     parancs = [YTDLP_EXE, "-j", "--no-playlist"] + (extra or []) + [url]
-    naplo_parancs("yt-dlp lekérdezés", parancs)
+    naplo_parancs("yt-dlp lekérdezés", parancs, lap)
     try:
         result = subprocess.run(
             parancs, capture_output=True, text=True, encoding="utf-8",
@@ -1173,124 +1175,8 @@ class TartomanySav(tk.Canvas):
                              width=2)
 
 
-class Alkalmazas(tk.Tk):
-
-    def __init__(self):
-        super().__init__()
-        self.beallitas = beallitasok_betoltes()
-
-        self.title(PROGRAM_NEV)
-        self.configure(bg=SZIN["hatter"])
-        self._ablak_meret()
-        self._ikon_beallitas()
-
-        # --- állapot ---
-        self.formatumok = []
-        self.mp3_lista = []
-        self.info = None
-        self.lekerdezett_url = None
-        self.video_hossz = None
-        self.utolso_mappa = None
-        self.elemezve = False
-        self.fut = False                  # bármilyen művelet
-        self.letolt_fut = False           # kifejezetten letöltés
-        self.process = None
-        self._megszakitva = False
-        self._destroyed = False
-        self._elemzes_idozito = None
-        self._elozo_url_szoveg = ""
-        self._haladas_utolso = 0.0
-        self._boritokep = None            # PhotoImage referencia kell, hogy megmaradjon
-
-        self._stilus_beallitas()
-        self._ui_felepites()
-        self._beallitasok_alkalmazasa()
-
-        self.protocol("WM_DELETE_WINDOW", self._kilep)
-        threading.Thread(target=self._init_eszkozok, daemon=True).start()
-
-    # ------------------------------------------------------------ felület --
-
-    def _ikon_beallitas(self):
-        """Ablak- és tálcaikon. Exe-ből futva a PyInstaller kicsomagolt
-        mappájából, forrásból a szkript mellől."""
-        alap = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
-        for nev in ("icon_youtube_letolto.ico",):
-            utvonal = os.path.join(alap, nev)
-            if os.path.isfile(utvonal):
-                try:
-                    self.iconbitmap(utvonal)
-                    return
-                except tk.TclError as e:
-                    fajlba_naplo(f"ikon betöltése sikertelen: {e}")
-
-    def _ablak_meret(self):
-        sz = min(1000, self.winfo_screenwidth() - 80)
-        m = min(950, self.winfo_screenheight() - 110)
-        self.geometry(f"{max(sz, 860)}x{max(m, 620)}")
-        # A minimum azért kell, hogy a napló és a haladásjelző soha ne
-        # szoruljon ki az ablakból (kis ablakban korábban eltűnt).
-        self.minsize(840, 600)
-
-    def _stilus_beallitas(self):
-        st = ttk.Style(self)
-        st.theme_use("clam")
-
-        st.configure("Treeview",
-                     background=SZIN["mezo"], fieldbackground=SZIN["mezo"],
-                     foreground=SZIN["szoveg"], borderwidth=0, relief="flat",
-                     rowheight=30, font=(BETU, 10))
-        st.map("Treeview",
-               background=[("selected", SZIN["kiemel"])],
-               foreground=[("selected", "#ffffff")])
-        st.configure("Treeview.Heading",
-                     background=SZIN["panel2"], foreground=SZIN["halvany"],
-                     relief="flat", borderwidth=0, padding=(10, 7),
-                     font=(BETU, 9, "bold"))
-        st.map("Treeview.Heading", background=[("active", SZIN["keret2"])])
-        st.layout("Minoseg.Treeview", st.layout("Treeview"))
-
-        # Legördülő: a mező a clam témában külön színezhető, a lenyíló lista
-        # viszont egy sima Listbox - azt csak option_add-dal lehet elérni.
-        st.configure("Sotet.TCombobox",
-                     fieldbackground=SZIN["mezo"], background=SZIN["panel2"],
-                     foreground=SZIN["szoveg"], arrowcolor=SZIN["halvany"],
-                     bordercolor=SZIN["keret"], lightcolor=SZIN["keret"],
-                     darkcolor=SZIN["keret"], relief="flat", padding=(8, 2))
-        st.map("Sotet.TCombobox",
-               fieldbackground=[("readonly", SZIN["mezo"]),
-                                ("disabled", SZIN["panel"])],
-               foreground=[("disabled", SZIN["halvany2"])],
-               arrowcolor=[("disabled", SZIN["halvany2"])],
-               bordercolor=[("focus", SZIN["kiemel"])])
-        self.option_add("*TCombobox*Listbox.background", SZIN["mezo"])
-        self.option_add("*TCombobox*Listbox.foreground", SZIN["szoveg"])
-        self.option_add("*TCombobox*Listbox.selectBackground", SZIN["kiemel"])
-        self.option_add("*TCombobox*Listbox.selectForeground", "#ffffff")
-        self.option_add("*TCombobox*Listbox.font", (BETU, 9))
-
-        st.configure("Fo.Horizontal.TProgressbar",
-                     troughcolor=SZIN["panel2"], bordercolor=SZIN["panel2"],
-                     background=SZIN["kiemel"], lightcolor=SZIN["kiemel"],
-                     darkcolor=SZIN["kiemel"], thickness=10)
-        st.configure("Siker.Horizontal.TProgressbar",
-                     troughcolor=SZIN["panel2"], bordercolor=SZIN["panel2"],
-                     background=SZIN["siker"], lightcolor=SZIN["siker"],
-                     darkcolor=SZIN["siker"], thickness=10)
-
-        # Nyilak nélküli, keskeny görgetősáv - a rendszer alapértelmezett
-        # nyilai világosak, és elrontanák a sötét felületet.
-        st.layout("Vertical.TScrollbar",
-                  [("Vertical.Scrollbar.trough", {"sticky": "ns", "children": [
-                      ("Vertical.Scrollbar.thumb",
-                       {"expand": "1", "sticky": "nswe"})]})])
-        st.configure("Vertical.TScrollbar",
-                     background=SZIN["keret2"], troughcolor=SZIN["mezo"],
-                     bordercolor=SZIN["mezo"], darkcolor=SZIN["keret2"],
-                     lightcolor=SZIN["keret2"], arrowcolor=SZIN["halvany"],
-                     relief="flat", borderwidth=0, width=10)
-        st.map("Vertical.TScrollbar",
-               background=[("active", SZIN["halvany2"])])
+class FeluletSegedek:
+    """Az ablak és a lapok közös felületi apróságai."""
 
     def _cimke(self, szulo, szoveg, meret=10, szin=None, vastag=False, **kw):
         return tk.Label(szulo, text=szoveg, bg=szulo["bg"],
@@ -1305,51 +1191,100 @@ class Alkalmazas(tk.Tk):
         kulso.belso = belso
         return kulso
 
-    def _ui_felepites(self):
-        self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(1, weight=4, minsize=240)   # törzs
-        self.grid_rowconfigure(3, weight=1, minsize=124)   # napló
 
-        self._fejlec_epites()
-        self._lablec_epites()
+class Lap(tk.Frame, FeluletSegedek):
+    """Egy önálló letöltési munkamenet: saját URL, formátumlista, folyamat és
+    napló. Több lap futhat egyszerre, egymástól függetlenül."""
+
+    def __init__(self, alkalmazas, szulo, azonosito):
+        super().__init__(szulo, bg=SZIN["hatter"])
+        self.alk = alkalmazas
+        self.beallitas = alkalmazas.beallitas
+        self.azonosito = azonosito
+        self.naplo_cimke = f"[lap {azonosito}]"
+
+        # --- állapot ---
+        self.formatumok = []
+        self.mp3_lista = []
+        self.info = None
+        self.lekerdezett_url = None
+        self.video_hossz = None
+        self.utolso_mappa = None
+        self.elemezve = False
+        self.fut = False                  # bármilyen művelet
+        self.letolt_fut = False           # kifejezetten letöltés
+        self.process = None
+        self._megszakitva = False
+        self._lezarva = False
+        self._elemzes_idozito = None
+        self._elozo_url_szoveg = ""
+        self._haladas_utolso = 0.0
+        self._boritokep = None            # PhotoImage referencia kell, hogy megmaradjon
+
+        # --- a lapfülön látszó állapot ---
+        self.lap_cim = ""
+        self.lap_allapot = "ures"         # ures/elemzes/kesz_elemzes/letoltes/kesz/hiba/megszakitva
+        self.lap_szazalek = 0.0
+
+        self._ui_felepites()
+        self._beallitasok_alkalmazasa()
+
+    # -- a lapfül tartalma --
+
+    def jelzes(self):
+        """A lapfülön látható kis állapotjelző: (jel, szín)."""
+        return {
+            "kesz": ("✓", "siker"),
+            "hiba": ("✕", "hiba"),
+            "megszakitva": ("■", "figyelem"),
+            "letoltes": (f"{self.lap_szazalek:.0f}%", "kiemel"),
+            "elemzes": ("◌", "figyelem"),
+            "kesz_elemzes": ("●", "siker"),
+        }.get(self.lap_allapot, ("●", "halvany2"))
+
+    def ful_felirat(self):
+        cim = self.lap_cim or f"Új lap {self.azonosito}"
+        return cim if len(cim) <= 26 else cim[:25] + "…"
+
+    def _ful_frissites(self):
+        self.alk.lap_jelzes_frissites(self)
+
+    def lezaras(self):
+        """A lap bezárásakor: futó munka leállítása."""
+        self._lezarva = True
+        self._megszakitva = True
+        self._folyamat_leallitas()
+
+    def fokusz(self):
+        try:
+            self.url_mezo.entry.focus_set()
+        except tk.TclError:
+            pass
+
+    # ------------------------------------------------------------ felület --
+
+    def _ui_felepites(self):
+        # A lap három sorból áll: törzs, akciósáv, napló. A sor-minsize-ok
+        # tartják bent a naplót és a haladásjelzőt kis ablakban is.
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(0, weight=4, minsize=240)   # törzs
+        self.grid_rowconfigure(2, weight=1, minsize=124)   # napló
+
         self._torzs_epites()
         self._akciosav_epites()
         self._naplo_epites()
 
-    # -- fejléc --------------------------------------------------------------
-
-    def _fejlec_epites(self):
-        keret = tk.Frame(self, bg=SZIN["panel"], height=58)
-        keret.grid(row=0, column=0, sticky="ew")
-        keret.grid_propagate(False)
-
-        bal = tk.Frame(keret, bg=SZIN["panel"])
-        bal.pack(side="left", padx=(20, 0), pady=12)
-        tk.Frame(bal, bg=SZIN["kiemel"], width=4).pack(side="left", fill="y",
-                                                       pady=2, padx=(0, 12))
-        self._cimke(bal, "YouTube Letöltő", 15, SZIN["szoveg"], True).pack(side="left")
-
-        jobb = tk.Frame(keret, bg=SZIN["panel"])
-        jobb.pack(side="right", padx=20, pady=12)
-        self.allapot_pont = tk.Label(jobb, text="●", bg=SZIN["panel"],
-                                     fg=SZIN["figyelem"], font=(BETU, 11))
-        self.allapot_pont.pack(side="left", padx=(0, 6))
-        self.allapot_cimke = self._cimke(jobb, "indulás…", 10, SZIN["halvany"])
-        self.allapot_cimke.pack(side="left")
-
-        tk.Frame(self, bg=SZIN["keret"], height=1).grid(row=0, column=0, sticky="sew")
-
-    def _allapot(self, szoveg, szin="halvany"):
-        def frissit():
-            self.allapot_cimke.config(text=szoveg, fg=SZIN[szin])
-            self.allapot_pont.config(fg=SZIN[szin if szin != "halvany" else "halvany2"])
-        self._fo_szalon(frissit)
+    def _allapot(self, szoveg, szin="halvany", allapot=None):
+        """A lap állapota: a lapfülön látszik, hogy épp mi történik rajta."""
+        if allapot:
+            self.lap_allapot = allapot
+        self._fo_szalon(self._ful_frissites)
 
     # -- törzs ---------------------------------------------------------------
 
     def _torzs_epites(self):
-        self.torzs = torzs = tk.Frame(self, bg=SZIN["hatter"], padx=20, pady=14)
-        torzs.grid(row=1, column=0, sticky="nsew")
+        self.torzs = torzs = tk.Frame(self, bg=SZIN["hatter"], padx=20, pady=10)
+        torzs.grid(row=0, column=0, sticky="nsew")
         torzs.grid_columnconfigure(0, weight=1)
         torzs.grid_rowconfigure(3, weight=1)          # a minőséglista nyúlik
 
@@ -1653,6 +1588,7 @@ class Alkalmazas(tk.Tk):
         self.fa.grid(row=0, column=0, sticky="nsew")
         self.fa.tag_configure("ajanlott", foreground=SZIN["siker"])
         self.fa.bind("<Double-1>", lambda e: self._letoltes_inditasa())
+        self.fa.bind("<Configure>", lambda e: self._fa_szelesseg_igazitas())
         # Más felbontás más forráskonténert jelenthet (webm vs mp4), amitől az
         # "Automatikus" beállítás eredménye is változik.
         self.fa.bind("<<TreeviewSelect>>", lambda e: self._minoseg_osszefoglalo())
@@ -1673,7 +1609,10 @@ class Alkalmazas(tk.Tk):
         # MP3 bitrátát. A minsize garantálja, hogy a lista sose lapuljon a
         # fejlécsorra akkor sem, ha az ablak szűk.
         self.minoseg_keret.grid()
-        self.torzs.grid_rowconfigure(3, weight=1, minsize=186)
+        # A minsize nem lehet túl nagy: ha a törzs nem fér ki, a grid a
+        # súlyozott sort húzza össze - ha az nem enged, az ALATTA lévő sorok
+        # (mentés helye) csúsznak ki az ablakból.
+        self.torzs.grid_rowconfigure(3, weight=1, minsize=150)
 
     def _minoseg_osszefoglalo(self):
         self._konteneres_felirat_frissites()
@@ -1699,9 +1638,9 @@ class Alkalmazas(tk.Tk):
 
     def _akciosav_epites(self):
         keret = tk.Frame(self, bg=SZIN["panel"], padx=20, pady=12)
-        keret.grid(row=2, column=0, sticky="ew")
+        keret.grid(row=1, column=0, sticky="ew")
         keret.grid_columnconfigure(1, weight=1)
-        tk.Frame(self, bg=SZIN["keret"], height=1).grid(row=2, column=0, sticky="new")
+        tk.Frame(self, bg=SZIN["keret"], height=1).grid(row=1, column=0, sticky="new")
 
         self.letoltes_gomb = Gomb(keret, "↓   Letöltés", self._letoltes_inditasa,
                                   "elsodleges", meret=12, vastag=True,
@@ -1727,23 +1666,13 @@ class Alkalmazas(tk.Tk):
                                "masodlagos", meret=10)
         self.mappa_gomb.grid(row=0, column=2, rowspan=2, sticky="e", padx=(14, 0))
 
-    # -- lábléc --------------------------------------------------------------
-
-    def _lablec_epites(self):
-        """Build szám kicsiben, bal alul - hibabejelentéskor ez az első kérdés,
-        de ne foglalja az ablak címsorát."""
-        keret = tk.Frame(self, bg=SZIN["hatter"], padx=20)
-        keret.grid(row=4, column=0, sticky="ew", pady=(0, 6))
-        self._cimke(keret, f"build {BUILD_SZAM}", 8,
-                    SZIN["halvany2"]).pack(side="left")
-
     # -- napló ---------------------------------------------------------------
 
     def _naplo_epites(self):
         # A tk.Frame padx/pady-ja egyetlen távolság (a pack/grid-é lehet tuple),
         # ezért az alsó margót a grid adja.
         self.naplo_keret = tk.Frame(self, bg=SZIN["hatter"], padx=20, pady=10)
-        self.naplo_keret.grid(row=3, column=0, sticky="nsew", pady=(0, 4))
+        self.naplo_keret.grid(row=2, column=0, sticky="nsew", pady=(0, 4))
         self.naplo_keret.grid_columnconfigure(0, weight=1)
         self.naplo_keret.grid_rowconfigure(1, weight=1)
 
@@ -1792,24 +1721,40 @@ class Alkalmazas(tk.Tk):
 
     # ------------------------------------------------------- alap segédek --
 
+    def _leallt(self):
+        """A lapot bezárták, vagy az egész ablak megszűnt."""
+        return self._lezarva or self.alk._destroyed
+
     def _fo_szalon(self, fv, *argumentumok):
         """Tkinter nem szálbiztos: minden widget-művelet a fő szálon fut.
 
         Az ellenőrzés és a hívás között is leállhat az értelmező, ezért a
         RuntimeError-t is el kell kapni."""
-        if self._destroyed:
+        if self._leallt():
             return
         try:
-            self.after(0, lambda: None if self._destroyed else fv(*argumentumok))
+            self.after(0, lambda: None if self._leallt() else fv(*argumentumok))
         except RuntimeError:
             pass
 
-    def _log(self, szoveg, csak_fajlba=False):
-        """A napló mindig fájlba is megy - a hibakereséshez ez a forrás."""
-        fajlba_naplo(szoveg.strip("\n") if szoveg.strip() else szoveg)
-        if csak_fajlba:
-            return
+    def _fajlnaplo(self, szoveg):
+        """Csak a naplófájlba, a lap azonosítójával megjelölve."""
+        fajlba_naplo(szoveg, self.naplo_cimke)
 
+    def _log(self, szoveg, csak_fajlba=False):
+        """A napló mindig fájlba is megy - a hibakereséshez ez a forrás.
+
+        A lapazonosító azért kerül a fájlba, mert több lap egyszerre is
+        tölthet, és a sorok különben összekeverednének."""
+        self._fajlnaplo(szoveg.strip("\n") if szoveg.strip() else szoveg)
+        if not csak_fajlba:
+            self.naplo_kiiras(szoveg)
+
+    def naplo_kiiras(self, szoveg):
+        """Csak a lap napló-ablakába ír; a fájlba a hívó írt már.
+
+        Az ablak ezen keresztül tudja minden nyitott lapra kiírni a közös
+        üzeneteket (pl. az eszközök letöltését)."""
         def frissit():
             tag = ""
             if szoveg.startswith(("✅", "🎉")):
@@ -1852,6 +1797,10 @@ class Alkalmazas(tk.Tk):
                 self.haladas["value"] = max(0, min(100, szazalek))
             if szoveg is not None:
                 self.haladas_cimke.config(text=szoveg)
+            # A lapfül is mutassa a százalékot, hogy másik lapról is látszódjon.
+            if szazalek is not None and self.letolt_fut:
+                self.lap_szazalek = max(0.0, min(100.0, szazalek))
+            self._ful_frissites()
         self._fo_szalon(frissit)
 
     def _haladas_fojtott(self, szazalek, szoveg):
@@ -1863,33 +1812,6 @@ class Alkalmazas(tk.Tk):
         self._haladas_beallit(szazalek, szoveg)
 
     # ------------------------------------------------------------ eszközök --
-
-    def _init_eszkozok(self):
-        try:
-            self._allapot("eszközök ellenőrzése…", "figyelem")
-            self._log("Eszközök ellenőrzése…")
-            eszközök_letöltése(self._log)
-            ytdlp_frissites(self._log)
-            self._verziok_naplozasa()
-            self._log("✅ Kész. Illeszd be a videó linkjét.")
-            self._allapot("készen áll", "siker")
-        except Exception as e:
-            self._log(f"❌ Hiba az eszközök letöltésekor: {e}")
-            self._allapot("eszközhiba", "hiba")
-            fajlba_naplo(traceback.format_exc())
-
-    def _verziok_naplozasa(self):
-        """Verziók a naplóba - hibakereséskor ez az első kérdés."""
-        for cimke, parancs in (("yt-dlp", [YTDLP_EXE, "--version"]),
-                               ("ffmpeg", [FFMPEG_EXE, "-version"])):
-            try:
-                r = subprocess.run(parancs, capture_output=True, text=True,
-                                   encoding="utf-8", errors="replace", timeout=30,
-                                   creationflags=subprocess.CREATE_NO_WINDOW)
-                elso = (r.stdout or r.stderr or "").strip().splitlines()
-                fajlba_naplo(f"{cimke} verzió: {elso[0] if elso else '?'}")
-            except Exception as e:
-                fajlba_naplo(f"{cimke} verzió lekérése sikertelen: {e}")
 
     def _eszkozok_keszen(self):
         """A letöltéshez a yt-dlp és az ffmpeg is kell (merge, mp3, szakasz)."""
@@ -1992,12 +1914,6 @@ class Alkalmazas(tk.Tk):
         self.konteneres_lista.config(state="readonly" if elemezve else "disabled")
         self._szakasz_valtozott()
 
-    def _kilep(self):
-        self._destroyed = True
-        self._beallitasok_mentese()
-        self._folyamat_leallitas()
-        self.destroy()
-
     # --------------------------------------------------------- elemzés -----
 
     def _elemzes_inditasa(self):
@@ -2028,7 +1944,7 @@ class Alkalmazas(tk.Tk):
 
         self.fut = True
         self.elemzes_gomb.config(state="disabled", text="Elemzés…")
-        self._allapot("elemzés…", "kiemel")
+        self._allapot("elemzés…", "kiemel", "elemzes")
         self._haladas_beallit(None, "Videó adatainak lekérdezése…")
         self._formatumok_torlese()
         threading.Thread(target=self._elemzes_worker, args=(url,), daemon=True).start()
@@ -2047,10 +1963,10 @@ class Alkalmazas(tk.Tk):
     def _elemzes_worker(self, url):
         try:
             self._log(f"\n🔍 Elemzés: {url}")
-            info, hiba = formatumok_lekerese(url)
+            info, hiba = formatumok_lekerese(url, lap=self.naplo_cimke)
             if hiba or not info:
                 self._log(f"❌ {hiba}")
-                self._allapot("sikertelen elemzés", "hiba")
+                self._allapot("sikertelen elemzés", "hiba", "hiba")
                 self._haladas_beallit(0, "Az elemzés nem sikerült.")
                 return
 
@@ -2062,6 +1978,7 @@ class Alkalmazas(tk.Tk):
             self.mp3_lista = mp3_valasztekok(info)
 
             cim = info.get("title") or "?"
+            self.lap_cim = cim                 # ez látszik majd a lapfülön
             self._log(f"📹 {cim}"
                       + (f"  |  {ido_formazas(hossz)}" if hossz else ""))
 
@@ -2075,13 +1992,13 @@ class Alkalmazas(tk.Tk):
                           "(lehet, hogy ez csak hang).")
 
             self._fo_szalon(self._elemzes_megjelenites)
-            self._allapot("kész az elemzés", "siker")
+            self._allapot("kész az elemzés", "siker", "kesz_elemzes")
             threading.Thread(target=self._boritokep_elonezet,
                              args=(info,), daemon=True).start()
         except Exception as e:
             self._log(f"❌ Váratlan hiba az elemzés közben: {e}")
-            fajlba_naplo(traceback.format_exc())
-            self._allapot("hiba", "hiba")
+            fajlba_naplo(traceback.format_exc(), self.naplo_cimke)
+            self._allapot("hiba", "hiba", "hiba")
         finally:
             self.fut = False
             self._fo_szalon(lambda: self.elemzes_gomb.config(
@@ -2149,7 +2066,9 @@ class Alkalmazas(tk.Tk):
                       f["meret_szoveg"]) for f in lista]
         for azon, cim, szelesseg in fejlecek:
             self.fa.heading(azon, text=cim)
-            self.fa.column(azon, width=szelesseg)
+            # A stretch-et minden feltöltésnél újra ki kell mondani: a lap
+            # elrejtése/visszahozása után különben nem tölti ki a szélességet.
+            self.fa.column(azon, width=szelesseg, stretch=(azon == "nev"))
 
         for i, ertekek in enumerate(reversed(sorok)):
             elem = self.fa.insert("", "end", iid=str(len(sorok) - 1 - i),
@@ -2175,6 +2094,29 @@ class Alkalmazas(tk.Tk):
                                           "letölthető formátumot.")
             self.minoseg_ures.place(relx=0.5, rely=0.5, anchor="center")
         self._meret_oszlop_frissites()
+        self.after_idle(self._fa_szelesseg_igazitas)
+
+    def _fa_szelesseg_igazitas(self):
+        """A névoszlop töltse ki a maradék helyet.
+
+        A ttk.Treeview csak <Configure> eseményre osztja újra a szélességet, a
+        lap elrejtése és visszahozása viszont nem vált ki ilyet - ezért a
+        stretch magától nem elég, ki kell számolni."""
+        try:
+            teljes = self.fa.winfo_width()
+            if teljes <= 10:
+                return
+            oszlopok = self.fa.cget("displaycolumns")
+            if not oszlopok or oszlopok[0] == "#all":
+                oszlopok = self.fa.cget("columns")
+            tobbi = sum(int(self.fa.column(o, "width"))
+                        for o in oszlopok if o != "nev")
+            kell = max(150, teljes - tobbi - 4)
+            # Csak érdemi eltérésnél írunk, különben a Configure önmagát hívná.
+            if abs(int(self.fa.column("nev", "width")) - kell) > 2:
+                self.fa.column("nev", width=kell)
+        except (tk.TclError, ValueError):
+            pass
 
     def _szakasz_arany(self):
         """A kijelölt részlet hossza a teljes videóhoz képest (0-1)."""
@@ -2215,8 +2157,9 @@ class Alkalmazas(tk.Tk):
             url = url or info.get("thumbnail")
             if not url:
                 return
-            nyers = os.path.join(APP_MAPPA, "elonezet.nyers")
-            png = os.path.join(APP_MAPPA, "elonezet.png")
+            # Laponként külön fájl: két lap egyszerre is elemezhet.
+            nyers = os.path.join(APP_MAPPA, f"elonezet_{self.azonosito}.nyers")
+            png = os.path.join(APP_MAPPA, f"elonezet_{self.azonosito}.png")
             with open(nyers, "wb") as f:
                 f.write(http_tartomany(url, timeout=20, probalkozas=2))
             r = subprocess.run(
@@ -2238,10 +2181,10 @@ class Alkalmazas(tk.Tk):
                     self.kep_cimke.config(image=self._boritokep, text="",
                                           width=140, height=79)
                 except tk.TclError as e:
-                    fajlba_naplo(f"előnézeti kép betöltése sikertelen: {e}")
+                    self._fajlnaplo(f"előnézeti kép betöltése sikertelen: {e}")
             self._fo_szalon(beallit)
         except Exception as e:
-            fajlba_naplo(f"előnézeti kép hiba: {e}")
+            self._fajlnaplo(f"előnézeti kép hiba: {e}")
 
     # -------------------------------------------------------- letöltés -----
 
@@ -2377,8 +2320,9 @@ class Alkalmazas(tk.Tk):
         self.letoltes_gomb.config(text="⛔   Megszakítás")
         self.letoltes_gomb.stilus_valt("veszely")
         self.elemzes_gomb.config(state="disabled")
+        self.lap_szazalek = 0.0
         self._haladas_beallit(None, "Indítás…", "Fo.Horizontal.TProgressbar")
-        self._allapot("letöltés…", "kiemel")
+        self._allapot("letöltés…", "kiemel", "letoltes")
         threading.Thread(target=self._letoltes, args=(terv,), daemon=True).start()
 
     def _megallitas(self):
@@ -2388,7 +2332,7 @@ class Alkalmazas(tk.Tk):
         # saját szakasz-letöltő a Range kérések között ezt figyeli.
         self._megszakitva = True
         self._log("⛔ Letöltés megszakítva.")
-        self._allapot("megszakítva", "figyelem")
+        self._allapot("megszakítva", "figyelem", "megszakitva")
         self._folyamat_leallitas()
 
     def _folyamat_leallitas(self):
@@ -2404,7 +2348,7 @@ class Alkalmazas(tk.Tk):
                            capture_output=True, timeout=10,
                            creationflags=subprocess.CREATE_NO_WINDOW)
         except Exception as e:
-            fajlba_naplo(f"taskkill sikertelen: {e}")
+            self._fajlnaplo(f"taskkill sikertelen: {e}")
         try:
             if proc.poll() is None:
                 proc.terminate()
@@ -2437,14 +2381,14 @@ class Alkalmazas(tk.Tk):
                               "(ez a YouTube fojtása miatt lassabb).")
                 except Exception as e:
                     self._log(f"⚠️ A gyors szakaszletöltő hibája: {e}")
-                    fajlba_naplo(traceback.format_exc())
+                    self._fajlnaplo(traceback.format_exc())
                     self._log("↩️ Visszaesés a yt-dlp beépített szakaszolására.")
                 if self._megszakitva:
                     return
             siker = self._letoltes_ytdlp(terv)
         except Exception as e:
             self._log(f"❌ Váratlan hiba: {e}")
-            fajlba_naplo(traceback.format_exc())
+            self._fajlnaplo(traceback.format_exc())
         finally:
             self.process = None
             self.fut = False
@@ -2454,13 +2398,15 @@ class Alkalmazas(tk.Tk):
     def _letoltes_vege(self, siker):
         if self._megszakitva:
             self._haladas_beallit(0, "Megszakítva.", "Fo.Horizontal.TProgressbar")
+            self._allapot("megszakítva", "figyelem", "megszakitva")
         elif siker:
+            self.lap_szazalek = 100.0
             self._haladas_beallit(100, "Kész! ✅", "Siker.Horizontal.TProgressbar")
-            self._allapot("kész", "siker")
+            self._allapot("kész", "siker", "kesz")
         else:
             self._haladas_beallit(0, "Nem sikerült – nézd meg a naplót.",
                                   "Fo.Horizontal.TProgressbar")
-            self._allapot("hiba", "hiba")
+            self._allapot("hiba", "hiba", "hiba")
 
         def gombok():
             self.letoltes_gomb.config(state="normal", text="↓   Letöltés")
@@ -2471,7 +2417,7 @@ class Alkalmazas(tk.Tk):
     def _formatum_biztositas(self, url):
         """Letöltés előtti utolsó pillanatos lekérdezés, ha nincs friss lista."""
         self._log("🔍 Formátumok frissítése a letöltés előtt…")
-        info, hiba = formatumok_lekerese(url)
+        info, hiba = formatumok_lekerese(url, lap=self.naplo_cimke)
         if hiba or not info:
             self._log(f"⚠️ Nem sikerült frissíteni a formátumokat: {hiba}")
             return None
@@ -2539,10 +2485,10 @@ class Alkalmazas(tk.Tk):
                                           "scale=trunc(iw/2)*2:trunc(ih/2)*2",
                                           "-frames:v", "1", "-update", "1",
                                           "-q:v", "2", cel]):
-                    fajlba_naplo(f"borítókép kész: {kep_url[:120]}")
+                    self._fajlnaplo(f"borítókép kész: {kep_url[:120]}")
                     return cel
             except Exception as e:
-                fajlba_naplo(f"borítókép sikertelen ({kep_url[:80]}): {e}")
+                self._fajlnaplo(f"borítókép sikertelen ({kep_url[:80]}): {e}")
             finally:
                 if os.path.isfile(nyers):
                     try:
@@ -2554,9 +2500,10 @@ class Alkalmazas(tk.Tk):
 
     def _stream_url_frissites(self, url, format_id):
         """Új aláírt URL kérése ugyanarra a formátumra (403/410 után)."""
-        info, hiba = formatumok_lekerese(url, ["-f", str(format_id)])
+        info, hiba = formatumok_lekerese(url, ["-f", str(format_id)],
+                                         lap=self.naplo_cimke)
         if hiba or not info:
-            fajlba_naplo(f"URL frissítés sikertelen ({format_id}): {hiba}")
+            self._fajlnaplo(f"URL frissítés sikertelen ({format_id}): {hiba}")
             return None
         for jelolt in (info.get("requested_formats") or [info]):
             if jelolt.get("url"):
@@ -2588,7 +2535,7 @@ class Alkalmazas(tk.Tk):
             self._log(f"⚠️ {cimke}: nem derül ki a stream mérete.")
             return False
 
-        fajlba_naplo(f"{cimke}: index={index['tipus']} pontok={len(index['pontok'])} "
+        self._fajlnaplo(f"{cimke}: index={index['tipus']} pontok={len(index['pontok'])} "
                      f"adat_kezd={index['adat_kezd']} teljes={teljes} "
                      f"url={stream_url[:120]}...")
 
@@ -2606,7 +2553,7 @@ class Alkalmazas(tk.Tk):
         tartomanyok.append((byte_kezd, byte_veg))
         kell = sum(v - k for k, v in tartomanyok)
 
-        fajlba_naplo(f"{cimke}: byte tartomány {byte_kezd}-{byte_veg}, "
+        self._fajlnaplo(f"{cimke}: byte tartomány {byte_kezd}-{byte_veg}, "
                      f"letöltendő szakaszok: {tartomanyok} ({kell} byte)")
         self._log(f"   {cimke}: {kell / 1024 / 1024:.0f} MB letöltése "
                   f"(a teljes {teljes / 1024 / 1024:.0f} MB helyett)")
@@ -2691,7 +2638,7 @@ class Alkalmazas(tk.Tk):
         if self._megszakitva:
             return False
         eltelt = time.monotonic() - kezdet_ido
-        fajlba_naplo(f"{cimke}: kész, {kozos['kesz']} byte {eltelt:.1f} s alatt "
+        self._fajlnaplo(f"{cimke}: kész, {kozos['kesz']} byte {eltelt:.1f} s alatt "
                      f"({kozos['kesz'] / max(eltelt, 0.001) / 1048576:.1f} MB/s)")
         return True
 
@@ -2704,12 +2651,13 @@ class Alkalmazas(tk.Tk):
         self._log("   Csak a kért byte-tartomány töltődik le, nem a teljes videó.")
 
         fmt_spec = self._szakasz_formatum(mod, terv.get("formatum"))
-        fajlba_naplo(f"Szakasz mód={mod} mappa={mappa} kezd={kezd} veg={veg} "
+        self._fajlnaplo(f"Szakasz mód={mod} mappa={mappa} kezd={kezd} veg={veg} "
                      f"formátum-kifejezés={fmt_spec}")
         sort = (["-S", "abr,asr,proto"] if mod == "zene"
                 else ["-S", "res,fps,hdr:12,proto,tbr"])
         self._haladas_beallit(None, "Stream URL-ek lekérdezése…")
-        info, hiba = formatumok_lekerese(url, sort + ["-f", fmt_spec])
+        info, hiba = formatumok_lekerese(url, sort + ["-f", fmt_spec],
+                                         lap=self.naplo_cimke)
         if hiba or not info:
             self._log(f"⚠️ Nem sikerült lekérni a stream URL-eket: {hiba}")
             return False
@@ -2749,7 +2697,11 @@ class Alkalmazas(tk.Tk):
                 van_kep = (stream.get("vcodec") or "none") != "none"
                 cimke = "videó" if van_kep else "hang"
                 kiterjesztes = stream.get("ext", "mp4")
-                tmp = os.path.join(mappa, f".{alap}.{i}.{kiterjesztes}.tmp")
+                # A lapazonosító a névben azért kell, mert két lap ugyanazt a
+                # videót és szakaszt is töltheti - azonos név esetén egymás
+                # ideiglenes fájljába írnának.
+                tmp = os.path.join(
+                    mappa, f".{alap}.l{self.azonosito}.{i}.{kiterjesztes}.tmp")
                 ideiglenes.append(tmp)
                 arany_hossz = 0.9 * meretek[i] / osszes
                 if not self._szakasz_stream(stream, kezd, veg, tmp, cimke,
@@ -2763,7 +2715,8 @@ class Alkalmazas(tk.Tk):
 
             media_fajlok = list(ideiglenes)
             self._haladas_beallit(92, "Borítókép…")
-            boritokep = self._boritokep_letoltes(info, os.path.join(mappa, f".{alap}.jpg"))
+            boritokep = self._boritokep_letoltes(
+                info, os.path.join(mappa, f".{alap}.l{self.azonosito}.jpg"))
             if boritokep:
                 ideiglenes.append(boritokep)
 
@@ -2839,7 +2792,7 @@ class Alkalmazas(tk.Tk):
         if hossz:
             parancs += ["-progress", "pipe:1", "-nostats"]
         parancs += args
-        naplo_parancs("ffmpeg parancs", parancs)
+        naplo_parancs("ffmpeg parancs", parancs, self.naplo_cimke)
         self.process = subprocess.Popen(
             parancs, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             creationflags=subprocess.CREATE_NO_WINDOW)
@@ -2863,7 +2816,7 @@ class Alkalmazas(tk.Tk):
             utolso = sor
             self._log(f"[ffmpeg] {sor}", csak_fajlba=True)
         self.process.wait()
-        fajlba_naplo(f"ffmpeg kilépési kód: {self.process.returncode}")
+        self._fajlnaplo(f"ffmpeg kilépési kód: {self.process.returncode}")
         if self.process.returncode != 0:
             if not self._megszakitva:
                 self._log(f"❌ ffmpeg hiba: {utolso}")
@@ -2932,7 +2885,7 @@ class Alkalmazas(tk.Tk):
         parancs += [url]
 
         self._log(f"\n⬇️ Letöltés indul: {url}")
-        naplo_parancs("yt-dlp parancs", parancs)
+        naplo_parancs("yt-dlp parancs", parancs, self.naplo_cimke)
         allapot = {"fazis": 0, "mar_letoltve": False, "hiba": False, "fajl": None}
         try:
             self.process = subprocess.Popen(
@@ -2962,7 +2915,7 @@ class Alkalmazas(tk.Tk):
             return False
         except Exception as e:
             self._log(f"❌ Hiba: {e}")
-            fajlba_naplo(traceback.format_exc())
+            self._fajlnaplo(traceback.format_exc())
             return False
 
     def _video_formatum_kifejezes(self, valasztott):
@@ -3055,6 +3008,360 @@ class Alkalmazas(tk.Tk):
             self._log(sor, csak_fajlba=True)
             return
         self._log(sor)
+
+
+class Alkalmazas(tk.Tk, FeluletSegedek):
+    """Az ablak: lapfülek, közös stílus, ikon, eszközök letöltése.
+
+    A tényleges munkamenet a Lap osztályban van - abból több is futhat
+    egyszerre, egymástól függetlenül, saját letöltőszállal."""
+
+    LAP_MAX = 8            # ennél több egyidejű letöltés már a sávot fojtaná
+
+    def __init__(self):
+        super().__init__()
+        self.beallitas = beallitasok_betoltes()
+        self.title(PROGRAM_NEV)
+        self.configure(bg=SZIN["hatter"])
+
+        self._destroyed = False
+        self.lapok = []
+        self.aktiv_lap = None
+        self._lap_szamlalo = 0
+
+        self._ablak_meret()
+        self._ikon_beallitas()
+        self._stilus_beallitas()
+        self._ui_felepites()
+        self.uj_lap()
+
+        self.protocol("WM_DELETE_WINDOW", self._kilep)
+        self.bind_all("<Control-t>", lambda e: self.uj_lap())
+        self.bind_all("<Control-w>", lambda e: self.lap_bezaras(self.aktiv_lap))
+        self.bind_all("<Control-Tab>", lambda e: self.kovetkezo_lap())
+        threading.Thread(target=self._init_eszkozok, daemon=True).start()
+
+    # ------------------------------------------------------------ felület --
+
+    def _ikon_beallitas(self):
+        """Ablak- és tálcaikon. Exe-ből futva a PyInstaller kicsomagolt
+        mappájából, forrásból a szkript mellől."""
+        alap = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+        utvonal = os.path.join(alap, "icon_youtube_letolto.ico")
+        if os.path.isfile(utvonal):
+            try:
+                self.iconbitmap(utvonal)
+            except tk.TclError as e:
+                fajlba_naplo(f"ikon betöltése sikertelen: {e}")
+
+    def _ablak_meret(self):
+        sz = min(1000, self.winfo_screenwidth() - 80)
+        m = min(950, self.winfo_screenheight() - 110)
+        self.geometry(f"{max(sz, 860)}x{max(m, 620)}")
+        # A minimum azért kell, hogy a napló és a haladásjelző soha ne
+        # szoruljon ki az ablakból (kis ablakban korábban eltűnt).
+        self.minsize(840, 600)
+
+    def _stilus_beallitas(self):
+        st = ttk.Style(self)
+        st.theme_use("clam")
+
+        st.configure("Treeview",
+                     background=SZIN["mezo"], fieldbackground=SZIN["mezo"],
+                     foreground=SZIN["szoveg"], borderwidth=0, relief="flat",
+                     rowheight=30, font=(BETU, 10))
+        st.map("Treeview",
+               background=[("selected", SZIN["kiemel"])],
+               foreground=[("selected", "#ffffff")])
+        st.configure("Treeview.Heading",
+                     background=SZIN["panel2"], foreground=SZIN["halvany"],
+                     relief="flat", borderwidth=0, padding=(10, 7),
+                     font=(BETU, 9, "bold"))
+        st.map("Treeview.Heading", background=[("active", SZIN["keret2"])])
+
+        # Legördülő: a mező a clam témában külön színezhető, a lenyíló lista
+        # viszont egy sima Listbox - azt csak option_add-dal lehet elérni.
+        st.configure("Sotet.TCombobox",
+                     fieldbackground=SZIN["mezo"], background=SZIN["panel2"],
+                     foreground=SZIN["szoveg"], arrowcolor=SZIN["halvany"],
+                     bordercolor=SZIN["keret"], lightcolor=SZIN["keret"],
+                     darkcolor=SZIN["keret"], relief="flat", padding=(8, 2))
+        st.map("Sotet.TCombobox",
+               fieldbackground=[("readonly", SZIN["mezo"]),
+                                ("disabled", SZIN["panel"])],
+               foreground=[("disabled", SZIN["halvany2"])],
+               arrowcolor=[("disabled", SZIN["halvany2"])],
+               bordercolor=[("focus", SZIN["kiemel"])])
+        self.option_add("*TCombobox*Listbox.background", SZIN["mezo"])
+        self.option_add("*TCombobox*Listbox.foreground", SZIN["szoveg"])
+        self.option_add("*TCombobox*Listbox.selectBackground", SZIN["kiemel"])
+        self.option_add("*TCombobox*Listbox.selectForeground", "#ffffff")
+        self.option_add("*TCombobox*Listbox.font", (BETU, 9))
+
+        st.configure("Fo.Horizontal.TProgressbar",
+                     troughcolor=SZIN["panel2"], bordercolor=SZIN["panel2"],
+                     background=SZIN["kiemel"], lightcolor=SZIN["kiemel"],
+                     darkcolor=SZIN["kiemel"], thickness=10)
+        st.configure("Siker.Horizontal.TProgressbar",
+                     troughcolor=SZIN["panel2"], bordercolor=SZIN["panel2"],
+                     background=SZIN["siker"], lightcolor=SZIN["siker"],
+                     darkcolor=SZIN["siker"], thickness=10)
+
+        # Nyilak nélküli, keskeny görgetősáv - a rendszer alapértelmezett
+        # nyilai világosak, és elrontanák a sötét felületet.
+        st.layout("Vertical.TScrollbar",
+                  [("Vertical.Scrollbar.trough", {"sticky": "ns", "children": [
+                      ("Vertical.Scrollbar.thumb",
+                       {"expand": "1", "sticky": "nswe"})]})])
+        st.configure("Vertical.TScrollbar",
+                     background=SZIN["keret2"], troughcolor=SZIN["mezo"],
+                     bordercolor=SZIN["mezo"], darkcolor=SZIN["keret2"],
+                     lightcolor=SZIN["keret2"], arrowcolor=SZIN["halvany"],
+                     relief="flat", borderwidth=0, width=10)
+        st.map("Vertical.TScrollbar",
+               background=[("active", SZIN["halvany2"])])
+
+    def _ui_felepites(self):
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(2, weight=1)         # a lapok területe nyúlik
+
+        self._fejlec_epites()
+        self._lapcsik_epites()
+
+        self.lap_tarolo = tk.Frame(self, bg=SZIN["hatter"])
+        self.lap_tarolo.grid(row=2, column=0, sticky="nsew")
+        self.lap_tarolo.grid_columnconfigure(0, weight=1)
+        self.lap_tarolo.grid_rowconfigure(0, weight=1)
+
+        self._lablec_epites()
+
+    def _fejlec_epites(self):
+        keret = tk.Frame(self, bg=SZIN["panel"], height=52)
+        keret.grid(row=0, column=0, sticky="ew")
+        keret.grid_propagate(False)
+
+        bal = tk.Frame(keret, bg=SZIN["panel"])
+        bal.pack(side="left", padx=(20, 0), pady=10)
+        tk.Frame(bal, bg=SZIN["kiemel"], width=4).pack(side="left", fill="y",
+                                                       pady=2, padx=(0, 12))
+        self._cimke(bal, PROGRAM_NEV, 14, SZIN["szoveg"], True).pack(side="left")
+
+        jobb = tk.Frame(keret, bg=SZIN["panel"])
+        jobb.pack(side="right", padx=20, pady=10)
+        self.allapot_pont = tk.Label(jobb, text="●", bg=SZIN["panel"],
+                                     fg=SZIN["figyelem"], font=(BETU, 11))
+        self.allapot_pont.pack(side="left", padx=(0, 6))
+        self.allapot_cimke = self._cimke(jobb, "indulás…", 10, SZIN["halvany"])
+        self.allapot_cimke.pack(side="left")
+
+    def _lapcsik_epites(self):
+        keret = tk.Frame(self, bg=SZIN["panel2"])
+        keret.grid(row=1, column=0, sticky="ew")
+        tk.Frame(self, bg=SZIN["keret"], height=1).grid(row=1, column=0,
+                                                        sticky="sew")
+
+        self.uj_gomb = Gomb(keret, "+", self.uj_lap, "masodlagos", meret=13,
+                            vastag=True, padx=12, pady=3)
+        self.uj_gomb.pack(side="left", padx=(16, 8), pady=6)
+
+        self.lap_csik = tk.Frame(keret, bg=SZIN["panel2"])
+        self.lap_csik.pack(side="left", fill="both", expand=True,
+                           padx=(0, 16), pady=6)
+
+    def _lablec_epites(self):
+        """Build szám kicsiben, bal alul - hibabejelentéskor ez az első kérdés,
+        de ne foglalja az ablak címsorát."""
+        keret = tk.Frame(self, bg=SZIN["hatter"], padx=20)
+        keret.grid(row=3, column=0, sticky="ew", pady=(0, 6))
+        self._cimke(keret, f"build {BUILD_SZAM}", 8,
+                    SZIN["halvany2"]).pack(side="left")
+
+    # ----------------------------------------------------------- lapfülek --
+
+    def uj_lap(self):
+        """Új, üres lap - minden érték alapállapotban."""
+        if len(self.lapok) >= self.LAP_MAX:
+            messagebox.showinfo(
+                "Lapok", f"Egyszerre legfeljebb {self.LAP_MAX} lap lehet nyitva.")
+            return None
+        self._lap_szamlalo += 1
+        lap = Lap(self, self.lap_tarolo, self._lap_szamlalo)
+        self.lapok.append(lap)
+        self.lap_valtas(lap)
+        return lap
+
+    def lap_valtas(self, lap):
+        if lap is None or lap not in self.lapok:
+            return
+        for l in self.lapok:
+            if l is lap:
+                l.grid(row=0, column=0, sticky="nsew")
+            else:
+                l.grid_remove()
+        self.aktiv_lap = lap
+        self._lapcsik_ujraepites()
+        lap.fokusz()
+        # Az újra megjelenített lapon a táblázat szélességét igazítani kell.
+        lap.after_idle(lap._fa_szelesseg_igazitas)
+
+    def kovetkezo_lap(self):
+        if len(self.lapok) > 1 and self.aktiv_lap in self.lapok:
+            i = self.lapok.index(self.aktiv_lap)
+            self.lap_valtas(self.lapok[(i + 1) % len(self.lapok)])
+
+    def lap_bezaras(self, lap):
+        if lap is None or lap not in self.lapok:
+            return
+        if lap.letolt_fut and not messagebox.askyesno(
+                "Lap bezárása",
+                "Ezen a lapon még fut egy letöltés.\nMegszakítod és bezárod?"):
+            return
+        lap.lezaras()
+        self.lapok.remove(lap)
+        lap.destroy()
+        if not self.lapok:
+            self.uj_lap()                      # mindig maradjon egy lap
+        elif self.aktiv_lap is lap:
+            self.lap_valtas(self.lapok[-1])
+        else:
+            self._lapcsik_ujraepites()
+
+    FUL_SZELES = 220           # ennyi hely jut egy fülnek, amíg belefér
+    FUL_FER = 4                # ennyi fül fér ki normál ablakszélességben
+
+    def _lapcsik_ujraepites(self):
+        """A fülek teljes újrarajzolása (nyitás/zárás/váltás után).
+
+        Kevés fül fix szélességű - egyetlen lap ne nyúljon végig a sávon -,
+        soknál viszont egyenletesen összébb húzódnak, hogy mind kiférjen."""
+        for w in self.lap_csik.winfo_children():
+            w.destroy()
+        # A korábbi oszlopbeállítások megmaradnának lapok bezárása után is,
+        # ezért előbb mindet nullázzuk.
+        for i in range(self.LAP_MAX + 2):
+            self.lap_csik.grid_columnconfigure(i, weight=0, uniform="", minsize=0)
+        szuk = len(self.lapok) > self.FUL_FER
+        for i, lap in enumerate(self.lapok):
+            if szuk:
+                self.lap_csik.grid_columnconfigure(
+                    i, weight=1, uniform="ful", minsize=0)
+            else:
+                self.lap_csik.grid_columnconfigure(
+                    i, weight=0, uniform="", minsize=self.FUL_SZELES)
+            self._ful_epites(lap, i)
+        # A maradék helyet egy üres oszlop nyeli el, ha a fülek nem töltik ki.
+        self.lap_csik.grid_columnconfigure(
+            len(self.lapok), weight=0 if szuk else 1, uniform="", minsize=0)
+
+    def _ful_epites(self, lap, oszlop):
+        aktiv = lap is self.aktiv_lap
+        hatter = SZIN["hatter"] if aktiv else SZIN["panel"]
+        ful = tk.Frame(self.lap_csik, bg=hatter, padx=10, pady=5, cursor="hand2")
+        ful.grid(row=0, column=oszlop, sticky="ew", padx=(0, 3))
+
+        lap.ful_ikon = tk.Label(ful, bg=hatter, font=(BETU, 9, "bold"), width=4)
+        lap.ful_ikon.pack(side="left", padx=(0, 6))
+        lap.ful_cimke = tk.Label(ful, bg=hatter, anchor="w",
+                                 fg=SZIN["szoveg"] if aktiv else SZIN["halvany"],
+                                 font=(BETU, 9, "bold" if aktiv else "normal"))
+        lap.ful_cimke.pack(side="left", fill="x", expand=True)
+
+        zar = tk.Label(ful, text="✕", bg=hatter, fg=SZIN["halvany2"],
+                       font=(BETU, 8), cursor="hand2")
+        zar.pack(side="right", padx=(6, 0))
+        zar.bind("<Button-1>", lambda e, l=lap: self.lap_bezaras(l))
+        zar.bind("<Enter>", lambda e, w=zar: w.config(fg=SZIN["hiba"]))
+        zar.bind("<Leave>", lambda e, w=zar: w.config(fg=SZIN["halvany2"]))
+
+        # A gyerek widgetek elnyelnék a kattintást, ezért mindegyikre kell.
+        for w in (ful, lap.ful_ikon, lap.ful_cimke):
+            w.bind("<Button-1>", lambda e, l=lap: self.lap_valtas(l))
+        self.lap_jelzes_frissites(lap)
+
+    def lap_jelzes_frissites(self, lap):
+        """Egy fül állapotjelzőjének frissítése - ezt hívja a Lap, amikor
+        elemez, tölt vagy elkészül."""
+        ikon = getattr(lap, "ful_ikon", None)
+        if ikon is None:
+            return
+        try:
+            if not ikon.winfo_exists():
+                return
+            jel, szin = lap.jelzes()
+            ikon.config(text=jel, fg=SZIN[szin])
+            lap.ful_cimke.config(text=lap.ful_felirat())
+        except tk.TclError:
+            pass
+
+    # ------------------------------------------------------------ közösek --
+
+    def _fo_szalon(self, fv, *argumentumok):
+        if self._destroyed:
+            return
+        try:
+            self.after(0, lambda: None if self._destroyed else fv(*argumentumok))
+        except RuntimeError:
+            pass
+
+    def _allapot(self, szoveg, szin="halvany"):
+        """A fejléc jobb oldalán látszó közös állapot (eszközök, hibák)."""
+        def frissit():
+            self.allapot_cimke.config(text=szoveg, fg=SZIN[szin])
+            self.allapot_pont.config(fg=SZIN[szin if szin != "halvany" else "halvany2"])
+        self._fo_szalon(frissit)
+
+    def _log(self, szoveg, csak_fajlba=False):
+        """Közös üzenet: a fájlba egyszer, a naplóablakba minden nyitott lapon."""
+        fajlba_naplo(szoveg)
+        if csak_fajlba:
+            return
+        for lap in list(self.lapok):
+            lap.naplo_kiiras(szoveg)
+
+    # ------------------------------------------------------------ eszközök --
+
+    def _init_eszkozok(self):
+        try:
+            self._allapot("eszközök ellenőrzése…", "figyelem")
+            self._log("Eszközök ellenőrzése…")
+            eszközök_letöltése(self._log)
+            ytdlp_frissites(self._log)
+            self._verziok_naplozasa()
+            self._log("✅ Kész. Illeszd be a videó linkjét.")
+            self._allapot("készen áll", "siker")
+        except Exception as e:
+            self._log(f"❌ Hiba az eszközök letöltésekor: {e}")
+            self._allapot("eszközhiba", "hiba")
+            fajlba_naplo(traceback.format_exc())
+
+    def _verziok_naplozasa(self):
+        """Verziók a naplóba - hibakereséskor ez az első kérdés."""
+        for cimke, parancs in (("yt-dlp", [YTDLP_EXE, "--version"]),
+                               ("ffmpeg", [FFMPEG_EXE, "-version"])):
+            try:
+                r = subprocess.run(parancs, capture_output=True, text=True,
+                                   encoding="utf-8", errors="replace", timeout=30,
+                                   creationflags=subprocess.CREATE_NO_WINDOW)
+                elso = (r.stdout or r.stderr or "").strip().splitlines()
+                fajlba_naplo(f"{cimke} verzió: {elso[0] if elso else '?'}")
+            except Exception as e:
+                fajlba_naplo(f"{cimke} verzió lekérése sikertelen: {e}")
+
+    def _kilep(self):
+        futo = [l for l in self.lapok if l.letolt_fut]
+        if futo and not messagebox.askyesno(
+                "Kilépés",
+                f"{len(futo)} lapon még fut letöltés.\nMegszakítod és kilépsz?"):
+            return
+        self._destroyed = True
+        if self.aktiv_lap:
+            try:
+                self.aktiv_lap._beallitasok_mentese()
+            except Exception:
+                pass
+        for lap in self.lapok:
+            lap.lezaras()
+        self.destroy()
 
 
 def _globalis_hibakezeles():

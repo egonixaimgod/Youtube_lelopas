@@ -23,8 +23,16 @@ A `yt-dlp`-t és az `ffmpeg`-et első indításkor magától letölti, semmit ne
 - **Lejátszási lista** támogatás (részlet módban nem)
 - **Naplózás** – minden művelet az exe melletti `zeneletolto.log` fájlba kerül
 
+- **Lapok** – a bal felső `+` gombbal új lapot nyithatsz (`Ctrl+T`), és egyszerre több
+  letöltés futhat. Minden lap üresen indul, saját linkkel, minőséggel és naplóval.
+  A lapfülön látszik, mit tölt épp és hol tart; ha elkészült, **zöld pipa** kerül rá –
+  így másik lapról is látod, hogy kész van. Lap bezárása: a fülön az `✕` (`Ctrl+W`),
+  váltás a fülre kattintva vagy `Ctrl+Tab`-bal.
+
 ## Használat
 
+0. Ha több videót akarsz egyszerre, nyiss annyi lapot a `+` gombbal – a lépések
+   laponként külön értendők.
 1. Illeszd be a linket (**Beillesztés** gomb vagy Ctrl+V). A program magától elemzi:
    kiírja a címet, az előnézeti képet, a hosszt és az összes elérhető minőséget.
    Elemzés előtt a többi vezérlő szürke – nincs mit beállítani rajtuk.

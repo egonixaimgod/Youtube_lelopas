@@ -20,20 +20,24 @@ python zeneletolto.py    # run (stdlib only, no pip install needed)
 
 Both build scripts move `dist\zeneletolto.log` aside before wiping `dist\` and put it back afterwards, and refuse to build while `YouTube Letolto.exe` is running (PyInstaller otherwise dies with a confusing `PermissionError` on the locked exe). **Never let a build delete that log** — it is often the only record of a user-reported failure.
 
-No test suite, linter, or CI exists. `python -m pyflakes zeneletolto.py` catches the cheap mistakes. Verify real changes by running the GUI. For headless tests, load the module with `importlib`, then subclass `Alkalmazas` **without calling its `__init__`** (that would build the window) and supply the handful of attributes the worker methods touch:
+No test suite, linter, or CI exists. `python -m pyflakes zeneletolto.py` catches the cheap mistakes. Verify real changes by running the GUI. For headless tests, load the module with `importlib`, then subclass **`Lap`** (the download engine lives there, not on the window) **without calling its `__init__`** — that would build widgets — and supply the handful of attributes the worker methods touch:
 
 ```python
-class Teszt(z.Alkalmazas):
+class Teszt(z.Lap):
     def __init__(self):
         self._megszakitva = False
+        self._lezarva = False
         self.process = None
+        self.azonosito = 0
+        self.naplo_cimke = "[teszt]"
         self._haladas_utolso = 0.0
     def _log(self, s, csak_fajlba=False): print(s, flush=True)   # note the kwarg
+    def _fajlnaplo(self, s): pass
     def _haladas_fojtott(self, szazalek, szoveg): print(szazalek, szoveg)
     def _haladas_beallit(self, szazalek=None, szoveg=None, stilus=None): pass
 ```
 
-Then call `_szakasz_letoltes(terv)` or `_letoltes_ytdlp(terv)` directly with a `terv` dict (`url`, `mod`, `mappa`, `playlist`, `szakasz`, `formatum`, `friss`). Run the interpreter with `PYTHONUTF8=1` — the Hungarian log lines and emoji raise `UnicodeEncodeError` on the default Windows console codepage (cp1250).
+Then call `_szakasz_letoltes(terv)` or `_letoltes_ytdlp(terv)` directly with a `terv` dict (`url`, `mod`, `mappa`, `playlist`, `szakasz`, `formatum`, `friss`, `konteneres`). For UI tests, build a real `Alkalmazas()` and drive `app.uj_lap()` / `lap._elemzes_inditasa()` from `after()` callbacks. Run the interpreter with `PYTHONUTF8=1` — the Hungarian log lines and emoji raise `UnicodeEncodeError` on the default Windows console codepage (cp1250).
 
 To screenshot the running GUI without stealing focus from the user, use `PrintWindow(hwnd, hdc, 2)` (PW_RENDERFULLCONTENT), not `CopyFromScreen` — the latter captures whatever window happens to be on top.
 
@@ -110,12 +114,29 @@ The section path bypasses `_letoltes_ytdlp()` entirely, so anything that path ge
 
 Section output filenames embed the range (`Cím_[3-00-00_3-20-00].mp4`, via `fajlnev_tisztitas()`) so different excerpts of one video neither overwrite each other nor trip yt-dlp's "already downloaded" detection.
 
+## Tabs: `Alkalmazas` owns the window, `Lap` owns a download
+
+The window is a thin shell. **`Alkalmazas(tk.Tk)`** holds only what is shared: the ttk styles, the icon, the tool bootstrap thread, the header status line, the tab strip, and the footer build number. **`Lap(tk.Frame)`** is one complete download session — its own URL field, format list, section slider, folder, progress bar, log widget, worker thread, `process` and `_megszakitva` flag. Several `Lap`s run at once, independently; `FeluletSegedek` carries the `_cimke`/`_kartya` helpers both classes use.
+
+Things this split makes load-bearing:
+
+- **Every per-download value must live on the `Lap`, never on the window.** A stray `self.<something>` on `Alkalmazas` would silently be shared between concurrent downloads.
+- **`_fo_szalon()` on a Lap checks `self._lezarva or self.alk._destroyed`.** A closed tab's worker thread keeps running for a moment; without the first flag it would touch destroyed widgets.
+- **File-log lines carry `[lap N]` next to `[pid]`.** One process now runs several downloads, so the `[pid]` marker alone no longer separates them. `Lap._fajlnaplo()` adds the label; module-level helpers take an optional `lap=` argument (`fajlba_naplo`, `naplo_parancs`, `formatumok_lekerese`) so the yt-dlp argv lines are attributable too.
+- **Temp filenames include the tab id** (`.l2.` in `_szakasz_letoltes`, `elonezet_2.png` for the preview). Two tabs downloading the *same* video and range would otherwise write into each other's sparse temp files.
+- **`_letoltes_vege()` sets `lap_allapot`**, which drives the tab chip: `✓` (green) when finished, `%` while downloading, `◌` while analysing, `✕` on error. That is how a finished download is visible from another tab.
+- `_kilep()` asks before killing tabs that are still downloading, then calls `lezaras()` on each.
+
+`LAP_MAX` is 8. Each tab's ranged fetch already opens `SZAKASZ_PARHUZAM` (4) connections, so eight tabs mean 32 parallel requests — more tabs would fight each other for bandwidth rather than go faster.
+
 ## User interface
 
 Custom-themed Tkinter: `ttk` (clam) for the things tk lacks — `Treeview`, `Progressbar`, `Scrollbar` — and plain `tk` widgets elsewhere, because only those accept arbitrary colours on Windows. `Gomb` is a flat hover-effect button whose `configure()` override mutes the background when `state=disabled` (an accent-coloured disabled button reads as clickable). `Mezo` wraps an `Entry` in a 1 px frame that turns accent-coloured on focus. `TartomanySav` is a hand-drawn two-handle range slider on a `Canvas` (Tk has no such widget); it is kept in two-way sync with the two time `Mezo`s through the `_szakasz_frissul` re-entry guard.
 
 **Layout rules that exist because they broke.**
-- Root is a 4-row grid: header, body (`weight=4, minsize=240`), action bar, log (`weight=1, minsize=124`). The row minsizes plus `self.minsize(840, 600)` are what keep the log and the progress bar on screen — in the previous version the log panel vanished entirely when the window was not maximised.
+- The window is a 4-row grid (header, tab strip, tab container `weight=1`, footer); each `Lap` is a 3-row grid inside it (body `weight=4, minsize=240`, action bar, log `weight=1, minsize=124`). Those row minsizes plus `self.minsize(840, 600)` are what keep the log and the progress bar on screen — in an earlier version the log panel vanished entirely when the window was not maximised.
+- The quality list's row `minsize` must stay small enough (150) that the grid can shrink *it* when space runs short. When it could not, the rows **below** it (the download folder) were pushed out of the window instead — which is what the tab strip's extra 44 px first exposed.
+- A `ttk.Treeview` only redistributes column widths on `<Configure>`. Hiding a tab and showing it again fires no such event, so `stretch` alone leaves the columns bunched at the left; `_fa_szelesseg_igazitas()` computes the name column's width explicitly and is called on tab switch, after every list refill, and from a `<Configure>` binding (guarded by a 2 px threshold so it cannot re-trigger itself).
 - `tk.Frame`'s `padx`/`pady` take a **single** distance, unlike pack/grid's, which accept a tuple. `pady=(10, 14)` on a Frame raises `TclError: bad screen distance "10 14"`.
 - Prefer `↓` (U+2193) over `⬇` (U+2B07) in button labels: Segoe UI has no glyph for the latter and renders a tofu box.
 - A `ttk.Combobox`'s field is styleable, but its drop-down is a plain Tk `Listbox` reachable only through `option_add("*TCombobox*Listbox.…")` — without those four lines the list opens white-on-white in a dark UI.
