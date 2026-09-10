@@ -26,7 +26,7 @@ import urllib.error
 import zipfile
 import shutil
 
-BUILD_SZAM = 8                 # a rebuild szkript növeli minden kiadásnál
+BUILD_SZAM = 9                 # a rebuild szkript növeli minden kiadásnál
 PROGRAM_NEV = "YouTube Letöltő"
 
 APP_MAPPA = os.path.join(os.getenv("LOCALAPPDATA", "."), "ZeneLetolto")
@@ -310,23 +310,37 @@ def frissites_telepites(uj_exe, cel_exe, pid=None):
     """
     os.makedirs(FRISSITES_MAPPA, exist_ok=True)
     bat = os.path.join(FRISSITES_MAPPA, "frissit.bat")
+    # A PID-re várni NEM elég: a onefile exe két folyamat (a kicsomagoló
+    # bootloader és a Python gyerek), és az os.getpid() a gyereké. A szülő még
+    # fogja az exe-t, amikor a gyerek már kilépett - ha ilyenkor cseréljük le,
+    # a következő indulás félbeszakadt kicsomagolással és "Failed to load
+    # Python DLL" hibával jár. Ezért a valódi feltétel az, hogy a fájl
+    # cserélhető-e: addig próbáljuk, amíg sikerül.
     tartalom = (
         "@echo off\r\n"
-        "setlocal\r\n"
+        "setlocal enabledelayedexpansion\r\n"
         'set "PID=%~1"\r\n'
+        "set /a n=0\r\n"
         ":varakozas\r\n"
         'tasklist /fi "pid eq %PID%" /nh 2>nul | find /i "%PID%" >nul\r\n'
-        "if not errorlevel 1 (\r\n"
-        "    ping -n 2 127.0.0.1 >nul\r\n"
-        "    goto varakozas\r\n"
-        ")\r\n"
+        "if errorlevel 1 goto csere\r\n"
+        "ping -n 2 127.0.0.1 >nul\r\n"
+        "set /a n+=1\r\n"
+        "if !n! lss 30 goto varakozas\r\n"
+        ":csere\r\n"
+        "set /a n=0\r\n"
+        ":csere_ismet\r\n"
         f'move /y "{uj_exe}" "{cel_exe}" >nul 2>&1\r\n'
-        "if errorlevel 1 (\r\n"
-        "    ping -n 4 127.0.0.1 >nul\r\n"
-        f'    move /y "{uj_exe}" "{cel_exe}" >nul 2>&1\r\n'
-        ")\r\n"
+        "if not errorlevel 1 goto inditas\r\n"
+        "ping -n 2 127.0.0.1 >nul\r\n"
+        "set /a n+=1\r\n"
+        "if !n! lss 30 goto csere_ismet\r\n"
+        # Ha egy percig sem engedte el senki, inkább nem indítunk el egy
+        # félig lecserélt programot - a letöltött exe a helyén marad.
+        "exit /b 1\r\n"
+        ":inditas\r\n"
+        "ping -n 3 127.0.0.1 >nul\r\n"
         f'start "" "{cel_exe}"\r\n'
-        "endlocal\r\n"
         'del "%~f0"\r\n'
     )
     # A cmd.exe a rendszer kódlapján olvassa a parancsfájlt, nem utf-8-ban.
@@ -3301,6 +3315,9 @@ class Alkalmazas(tk.Tk, FeluletSegedek):
         self._lap_szamlalo = 0
         self._frissites_ablak_nyitva = None
         self.elerheto_frissites = None      # (build, exe_url), ha van újabb
+        # A közös (nem laphoz kötött) üzenetek, hogy a később nyitott lapok
+        # naplójában is ott legyenek - pl. az eszközök ellenőrzése.
+        self.kozos_naplo = []
 
         self._ablak_meret()
         self._ikon_beallitas()
@@ -3474,6 +3491,10 @@ class Alkalmazas(tk.Tk, FeluletSegedek):
         self._lap_szamlalo += 1
         lap = Lap(self, self.lap_tarolo, self._lap_szamlalo)
         self.lapok.append(lap)
+        # A közös üzenetek (eszközök ellenőrzése stb.) az új lap naplójába is
+        # kerüljenek be, különben üresen indul.
+        for sor in self.kozos_naplo:
+            lap.naplo_kiiras(sor)
         self.lap_valtas(lap)
         return lap
 
@@ -3605,10 +3626,14 @@ class Alkalmazas(tk.Tk, FeluletSegedek):
         self._fo_szalon(frissit)
 
     def _log(self, szoveg, csak_fajlba=False):
-        """Közös üzenet: a fájlba egyszer, a naplóablakba minden nyitott lapon."""
+        """Közös üzenet: a fájlba egyszer, a naplóablakba minden nyitott lapon.
+
+        Megjegyezzük is, hogy a később nyitott lapok naplója se legyen üres."""
         fajlba_naplo(szoveg)
         if csak_fajlba:
             return
+        self.kozos_naplo.append(szoveg)
+        del self.kozos_naplo[:-50]
         for lap in list(self.lapok):
             lap.naplo_kiiras(szoveg)
 
